@@ -164,7 +164,7 @@ def disagg_pareto(
     """
     Find Pareto front for Disaggregated Inference.
     This is a proxy function calls into
-    DisaggInferenceSession.find_best    _disagg_result_under_constraints.
+    DisaggInferenceSession.find_best_disagg_result_under_constraints.
 
     Args:
         model_path: name of the model

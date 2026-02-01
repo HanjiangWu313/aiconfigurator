@@ -4,6 +4,8 @@
 import copy
 import functools
 import logging
+import os
+import sys
 import warnings
 
 import pandas as pd
@@ -15,6 +17,33 @@ from aiconfigurator.sdk.utils import enumerate_ttft_tpot_constraints
 
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+# Get the directory of this file to build relative paths
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", "..", ".."))
+
+# Default network config path (relative to project root)
+DEFAULT_NETWORK_CONFIG = os.path.join(_PROJECT_ROOT, "network_backend", "astra-network-analytical", "input", "Ring.yml")
+
+# Network simulator library path (relative to project root)
+_NETWORK_SIM_LIB_PATH = os.path.join(_PROJECT_ROOT, "network_backend", "astra-network-analytical", "lib")
+
+# Attempt to import AstraSim network simulator
+sys.path.append(_NETWORK_SIM_LIB_PATH)
+try:
+    from simulation_py_congestion_aware import (
+        EventQueue,
+        Topology,
+        Chunk,
+        NetworkParser,
+        construct_topology,
+    )
+    NETWORK_SIM_AVAILABLE = True
+    print(f"AstraSim Network simulator loaded from {_NETWORK_SIM_LIB_PATH}")
+except ImportError:
+    NETWORK_SIM_AVAILABLE = False
+    print("AstraSim Network simulator not available, skipping network latency modeling")
+
 
 
 class InferenceSession:
@@ -151,6 +180,7 @@ class DisaggInferenceSession:
         prefill_backend: BaseBackend,
         decode_database: perf_database.PerfDatabase,
         decode_backend: BaseBackend,
+        network_file: str = None,  # NEW: optional network config file
     ) -> None:
         """
         Initialize the DisaggInferenceSession
@@ -161,8 +191,6 @@ class DisaggInferenceSession:
         self._decode_backend = decode_backend
 
         # allow user to set correction scales for better alignment with real system
-        # now the corection scales are used to correct the latency, not throughput,
-        # corrected latency = latency * correction_scale
         self._prefill_latency_correction_scale = 1.0
         self._decode_latency_correction_scale = 1.0
 
@@ -170,6 +198,24 @@ class DisaggInferenceSession:
         self._RATE_MATCHING_PREFILL_DEGRADATION_FACTOR = 0.9
         # comes from not saturating the batchsize slot of decode worker
         self._RATE_MATCHING_DECODE_DEGRADATION_FACTOR = 0.92
+
+        # AstraSim network simulator setup
+        self._network_file = network_file
+        self._enable_astrasim = False
+        self._network_queue = None
+        self._topology = None
+
+        if NETWORK_SIM_AVAILABLE:
+            if network_file is None:
+                network_file = DEFAULT_NETWORK_CONFIG
+            logger.info(f"Enabling AstraSim Network Engine with config: {network_file}")
+            self._enable_astrasim = True
+            self._network_queue = EventQueue()
+            network_parser = NetworkParser(network_file)
+            Topology.set_event_queue(self._network_queue)
+            self._topology = construct_topology(network_parser)
+        else:
+            logger.warning("Network file provided but AstraSim simulator not available")
 
     def set_latency_correction_scales(
         self, prefill_latency_correction_scale: float, decode_latency_correction_scale: float
@@ -307,6 +353,193 @@ class DisaggInferenceSession:
         summary_dict = self._get_disagg_summary_dict(prefill_dict, prefill_num_worker, decode_dict, decode_num_worker)
         return pd.DataFrame([summary_dict], columns=common.ColumnsDisagg).round(3)
 
+    def _compute_kv_cache_transfer_size(
+        self,
+        model_path: str,
+        prefill_model_config: config.ModelConfig,
+        runtime_config: config.RuntimeConfig,
+        prefill_batch_size: int,
+    ) -> int:
+        """
+            Compute the KV cache size to transfer from prefill to decode workers.
+            
+            Transfer size = num_prefill_tokens * hidden_size * dtype_size
+            
+            Returns:
+                int: KV cache size in bytes
+        """
+        from aiconfigurator.sdk.utils import get_model_config_from_model_path
+        
+        model_arch = get_model_config_from_model_path(model_path)
+        
+        hidden_size = model_arch[5]  # hidden size is the 6th element in model_arch tuple
+        num_prefill_tokens = prefill_batch_size * runtime_config.isl
+        
+        # KV cache quantization (fp8 = 1 byte, fp16 = 2 bytes)
+        kvcache_quant = prefill_model_config.kvcache_quant_mode
+        if hasattr(kvcache_quant, 'memory'):
+            dtype_size = kvcache_quant.memory
+        else:
+            dtype_size = 2  # Default to fp16
+        
+        # Transfer size in bytes
+        transfer_size = num_prefill_tokens * hidden_size * dtype_size
+        
+        # Log in MB
+        logger.debug(f"KV cache transfer size: {transfer_size}B "
+                     f"({num_prefill_tokens} tokens × {hidden_size} hidden_size × {dtype_size} bytes)")
+        
+        return transfer_size
+
+    def _build_gpu_layout(
+        self,
+        prefill_model_config: config.ModelConfig,
+        prefill_num_worker: int,
+        decode_model_config: config.ModelConfig,
+        decode_num_worker: int,
+    ) -> dict:
+        """
+        Build GPU layout mapping for prefill-to-decode transfers.
+        
+        Returns:
+            dict: {
+                'prefill_gpus': list of GPU IDs for prefill workers,
+                'decode_gpus': list of GPU IDs for decode workers,
+                'transfers': list of (src_gpu, dst_gpu, size) tuples
+            }
+        """
+        prefill_tp = prefill_model_config.tp_size
+        prefill_pp = prefill_model_config.pp_size
+        prefill_gpus_per_worker = prefill_tp * prefill_pp
+        
+        decode_tp = decode_model_config.tp_size
+        decode_pp = decode_model_config.pp_size
+        decode_gpus_per_worker = decode_tp * decode_pp
+        
+        # Assign GPU IDs
+        # Prefill GPUs: 0 to (prefill_num_worker * prefill_gpus_per_worker - 1)
+        # Decode GPUs: next available IDs
+        prefill_gpu_ids = []
+        for worker_id in range(prefill_num_worker):
+            start_gpu = worker_id * prefill_gpus_per_worker
+            worker_gpus = list(range(start_gpu, start_gpu + prefill_gpus_per_worker))
+            prefill_gpu_ids.append(worker_gpus)
+        
+        decode_gpu_start = prefill_num_worker * prefill_gpus_per_worker
+        decode_gpu_ids = []
+        for worker_id in range(decode_num_worker):
+            start_gpu = decode_gpu_start + worker_id * decode_gpus_per_worker
+            worker_gpus = list(range(start_gpu, start_gpu + decode_gpus_per_worker))
+            decode_gpu_ids.append(worker_gpus)
+        
+        return {
+            'prefill_workers': prefill_gpu_ids,  # [[0], [1], [2], [3]] for 4 workers with TP=1
+            'decode_workers': decode_gpu_ids,    # [[4, 5], [6, 7]] for 2 workers with TP=2
+            'prefill_gpus_per_worker': prefill_gpus_per_worker,
+            'decode_gpus_per_worker': decode_gpus_per_worker,
+            'total_prefill_gpus': prefill_num_worker * prefill_gpus_per_worker,
+            'total_decode_gpus': decode_num_worker * decode_gpus_per_worker,
+        }
+
+    def _simulate_network_transfer(
+        self,
+        gpu_layout: dict,
+        kv_cache_size: int,
+        prefill_batch_size: int,
+    ) -> float:
+        """
+        Simulate network transfer latency for KV cache from prefill to decode
+        using AstraSim network simulator.
+        
+        Args:
+            gpu_layout: GPU assignment from _build_gpu_layout
+            kv_cache_size: Total KV cache size in bytes
+            prefill_batch_size: Number of sequences in the batch
+            
+        Returns:
+            float: Network transfer latency in milliseconds
+        """
+        if not self._enable_astrasim:
+            logger.debug("AstraSim network simulator not enabled, returning 0 latency")
+            return 0.0
+        
+        logger.info("Using AstraSim Network Engine for KV cache transfer simulation")
+        
+        # Build transfer schedule
+        prefill_workers = gpu_layout['prefill_workers']
+        decode_workers = gpu_layout['decode_workers']
+        num_prefill_workers = len(prefill_workers)
+        num_decode_workers = len(decode_workers)
+        
+        # KV cache size per sequence
+        kv_size_per_seq = kv_cache_size // prefill_batch_size if prefill_batch_size > 0 else kv_cache_size
+        
+        # Sequences distributed evenly across prefill workers
+        seqs_per_prefill = max(1, prefill_batch_size // num_prefill_workers)
+        
+        try:
+            # Reset network queue for fresh simulation
+            self._network_queue = EventQueue()
+            Topology.set_event_queue(self._network_queue)
+            network_parser = NetworkParser(self._network_file)
+            self._topology = construct_topology(network_parser)
+            
+            # Create and send chunks for each KV cache transfer
+            chunk_id = 0
+            for p_idx, p_gpus in enumerate(prefill_workers):
+                # Last GPU in prefill worker (after PP) sends KV cache
+                src_gpu = p_gpus[-1]
+                
+                for seq_idx in range(seqs_per_prefill):
+                    # Round-robin assignment to decode workers
+                    d_idx = (p_idx * seqs_per_prefill + seq_idx) % num_decode_workers
+                    # First GPU in decode worker receives KV cache
+                    dst_gpu = decode_workers[d_idx][0]
+                    
+                    # Create chunk using AstraSim API
+                    # data_size is in bytes
+                    chunk = Chunk.create_with_event_queue(
+                        kv_size_per_seq,  # data_size in bytes
+                        src_gpu,          # source GPU ID
+                        dst_gpu,          # destination GPU ID
+                        chunk_id,         # request_id / chunk_id
+                        self._topology,
+                        self._network_queue,
+                    )
+                    
+                    # Send the chunk through the network
+                    self._topology.send_python(chunk)
+                    
+                    logger.debug(
+                        f"KV transfer chunk {chunk_id}: GPU {src_gpu} -> GPU {dst_gpu}, "
+                        f"{kv_size_per_seq} bytes"
+                    )
+                    chunk_id += 1
+            
+            # Run simulation until all transfers complete
+            # Process all events in the network queue
+            while not self._network_queue.empty():
+                event = self._network_queue.pop()
+                event.process()
+            
+            # Get the final simulation time (in nanoseconds)
+            final_time_ns = self._network_queue.get_current_time()
+            
+            # Convert nanoseconds to milliseconds
+            latency_ms = final_time_ns / 1e6
+            
+            logger.info(
+                f"AstraSim network transfer latency: {latency_ms:.3f} ms "
+                f"for {chunk_id} transfers, total {kv_cache_size} bytes"
+            )
+            return latency_ms
+            
+        except Exception as e:
+            logger.warning(f"AstraSim network simulation failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return 0.0
+
     def run_disagg(
         self,
         model_path: str,
@@ -344,9 +577,39 @@ class DisaggInferenceSession:
         prefill_runtime_config = copy.deepcopy(runtime_config)
         prefill_runtime_config.batch_size = prefill_batch_size
         prefill_summary = prefill_sess.run_static(mode="static_ctx", runtime_config=prefill_runtime_config)
+        
         decode_runtime_config = copy.deepcopy(runtime_config)
         decode_runtime_config.batch_size = decode_batch_size
         decode_summary = decode_sess.run_static(mode="static_gen", runtime_config=decode_runtime_config)
+
+        # === NEW: Network simulation for KV cache transfer ===
+        # 1. Compute KV cache size
+        kv_cache_size = self._compute_kv_cache_transfer_size(
+            model_path=model_path,
+            prefill_model_config=prefill_model_config,
+            runtime_config=runtime_config,
+            prefill_batch_size=prefill_batch_size,
+        )
+        logger.debug(f"KV cache transfer size: {kv_cache_size / 1e6:.2f} MB")
+
+        # 2. Build GPU layout
+        gpu_layout = self._build_gpu_layout(
+            prefill_model_config=prefill_model_config,
+            prefill_num_worker=prefill_num_worker,
+            decode_model_config=decode_model_config,
+            decode_num_worker=decode_num_worker,
+        )
+        logger.info(f"GPU layout: prefill={gpu_layout['prefill_workers']}, decode={gpu_layout['decode_workers']}")
+
+        # 3. Simulate network transfer
+        network_latency_ms = self._simulate_network_transfer(
+            gpu_layout=gpu_layout,
+            kv_cache_size=kv_cache_size,
+            prefill_batch_size=prefill_batch_size,
+        )
+        logger.info(f"Network transfer latency: {network_latency_ms:.3f} ms")
+        # === END: Network simulation ===
+
         disagg_summary_df = self._get_disagg_summary_df(
             prefill_summary.get_summary_df(),
             prefill_num_worker,
@@ -354,8 +617,22 @@ class DisaggInferenceSession:
             decode_num_worker,
         )
 
+        # Add network latency to TTFT (KV transfer happens after prefill, before decode)
+        if network_latency_ms > 0:
+            disagg_summary_df['ttft'] = disagg_summary_df['ttft'] + network_latency_ms
+            disagg_summary_df['request_latency'] = disagg_summary_df['request_latency'] + network_latency_ms
+            logger.info(f"Added network latency {network_latency_ms:.3f}ms to TTFT")
+
         disagg_summary = InferenceSummary(runtime_config=runtime_config)
         disagg_summary.set_summary_df(disagg_summary_df)
+        
+        # Store network info in summary for debugging
+        disagg_summary.network_info = {
+            'kv_cache_size_bytes': kv_cache_size,
+            'gpu_layout': gpu_layout,
+            'network_latency_ms': network_latency_ms,
+        }
+        
         return disagg_summary
 
     # optimization
@@ -574,7 +851,7 @@ class DisaggInferenceSession:
             prefill_candidates = (
                 prefill_candidates.sort_values(by=["seq/s/gpu", "global_bs"], ascending=[False, True])
                 .reset_index(drop=True)
-                .head(MAX_PREFILL_WORKERS)
+                .head(MAX_NUM_PREFILL_WORKER_CANDIDATES)
             )
 
             decode_candidates = decode_summary_df[
@@ -592,7 +869,7 @@ class DisaggInferenceSession:
                 parallel_group_sorted = (
                     parallel_group.sort_values(by=["seq/s/gpu"], ascending=[False])
                     .reset_index(drop=True)
-                    .head(MAX_DECODE_WORKERS_PER_CATEGORY)
+                    .head(MAX_NUM_DECODE_WORKER_CANDIDATES)
                 )
 
                 decode_workers_list = parallel_group_sorted.to_dict("records")
