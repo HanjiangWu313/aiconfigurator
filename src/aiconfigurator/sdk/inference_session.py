@@ -17,7 +17,7 @@ from aiconfigurator.sdk.utils import enumerate_ttft_tpot_constraints
 
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", category=FutureWarning)
-
+logging.basicConfig(level=logging.INFO)
 # Get the directory of this file to build relative paths
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", "..", ".."))
@@ -27,6 +27,9 @@ DEFAULT_NETWORK_CONFIG = os.path.join(_PROJECT_ROOT, "network_backend", "astra-n
 
 # Network simulator library path (relative to project root)
 _NETWORK_SIM_LIB_PATH = os.path.join(_PROJECT_ROOT, "network_backend", "astra-network-analytical", "lib")
+
+# TODO: Turn this into input later
+USE_ASTRA_SIM = True
 
 # Attempt to import AstraSim network simulator
 sys.path.append(_NETWORK_SIM_LIB_PATH)
@@ -207,11 +210,12 @@ class DisaggInferenceSession:
 
         if NETWORK_SIM_AVAILABLE:
             if network_file is None:
-                network_file = DEFAULT_NETWORK_CONFIG
+                print(DEFAULT_NETWORK_CONFIG)
+                self._network_file = str(DEFAULT_NETWORK_CONFIG)
             logger.info(f"Enabling AstraSim Network Engine with config: {network_file}")
             self._enable_astrasim = True
             self._network_queue = EventQueue()
-            network_parser = NetworkParser(network_file)
+            network_parser = NetworkParser(self._network_file)
             Topology.set_event_queue(self._network_queue)
             self._topology = construct_topology(network_parser)
         else:
@@ -479,10 +483,10 @@ class DisaggInferenceSession:
         
         try:
             # Reset network queue for fresh simulation
-            self._network_queue = EventQueue()
-            Topology.set_event_queue(self._network_queue)
-            network_parser = NetworkParser(self._network_file)
-            self._topology = construct_topology(network_parser)
+            # self._network_queue = EventQueue()
+            # Topology.set_event_queue(self._network_queue)
+            # network_parser = NetworkParser(self._network_file)
+            # self._topology = construct_topology(network_parser)
             
             # Create and send chunks for each KV cache transfer
             chunk_id = 0
@@ -510,18 +514,27 @@ class DisaggInferenceSession:
                     # Send the chunk through the network
                     self._topology.send_python(chunk)
                     
-                    logger.debug(
+                    logger.info(
                         f"KV transfer chunk {chunk_id}: GPU {src_gpu} -> GPU {dst_gpu}, "
                         f"{kv_size_per_seq} bytes"
                     )
                     chunk_id += 1
             
+            # chunk_id = 1  # Placeholder chunk ID
+            # chunk = Chunk.create_with_event_queue(
+            #     kv_size_per_seq,  # data_size in bytes
+            #     0,          # source GPU ID
+            #     5,          # destination GPU ID
+            #     chunk_id,         # request_id / chunk_id
+            #     self._topology,
+            #     self._network_queue,
+            # )
+            # self._topology.send_python(chunk)
+            
             # Run simulation until all transfers complete
             # Process all events in the network queue
-            while not self._network_queue.empty():
-                event = self._network_queue.pop()
-                event.process()
-            
+            while not self._network_queue.finished():
+                self._network_queue.proceed()
             # Get the final simulation time (in nanoseconds)
             final_time_ns = self._network_queue.get_current_time()
             
@@ -582,17 +595,17 @@ class DisaggInferenceSession:
         decode_runtime_config.batch_size = decode_batch_size
         decode_summary = decode_sess.run_static(mode="static_gen", runtime_config=decode_runtime_config)
 
-        # === NEW: Network simulation for KV cache transfer ===
-        # 1. Compute KV cache size
+        # # === NEW: Network simulation for KV cache transfer ===
+        # # 1. Compute KV cache size
         kv_cache_size = self._compute_kv_cache_transfer_size(
             model_path=model_path,
             prefill_model_config=prefill_model_config,
             runtime_config=runtime_config,
             prefill_batch_size=prefill_batch_size,
         )
-        logger.debug(f"KV cache transfer size: {kv_cache_size / 1e6:.2f} MB")
+        logger.info(f"KV cache transfer size: {kv_cache_size / 1e6:.2f} MB")
 
-        # 2. Build GPU layout
+        # # 2. Build GPU layout
         gpu_layout = self._build_gpu_layout(
             prefill_model_config=prefill_model_config,
             prefill_num_worker=prefill_num_worker,
@@ -601,14 +614,15 @@ class DisaggInferenceSession:
         )
         logger.info(f"GPU layout: prefill={gpu_layout['prefill_workers']}, decode={gpu_layout['decode_workers']}")
 
-        # 3. Simulate network transfer
+        # # 3. Simulate network transfer
         network_latency_ms = self._simulate_network_transfer(
             gpu_layout=gpu_layout,
             kv_cache_size=kv_cache_size,
             prefill_batch_size=prefill_batch_size,
         )
-        logger.info(f"Network transfer latency: {network_latency_ms:.3f} ms")
-        # === END: Network simulation ===
+        network_latency_ms = 0.0  # Placeholder if network sim is disabled
+        # logger.info(f"Network transfer latency: {network_latency_ms:.3f} ms")
+        # # === END: Network simulation ===
 
         disagg_summary_df = self._get_disagg_summary_df(
             prefill_summary.get_summary_df(),
@@ -626,12 +640,12 @@ class DisaggInferenceSession:
         disagg_summary = InferenceSummary(runtime_config=runtime_config)
         disagg_summary.set_summary_df(disagg_summary_df)
         
-        # Store network info in summary for debugging
-        disagg_summary.network_info = {
-            'kv_cache_size_bytes': kv_cache_size,
-            'gpu_layout': gpu_layout,
-            'network_latency_ms': network_latency_ms,
-        }
+        # TODO: Store network info in summary for debugging
+        # disagg_summary.network_info = {
+        #     'kv_cache_size_bytes': kv_cache_size,
+        #     'gpu_layout': gpu_layout,
+        #     'network_latency_ms': network_latency_ms,
+        # }
         
         return disagg_summary
 

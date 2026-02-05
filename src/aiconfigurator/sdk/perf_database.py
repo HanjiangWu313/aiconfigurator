@@ -3504,7 +3504,23 @@ class PerfDatabase:
             elif operation == "all_reduce":
                 sol_time = 2 * dtype.value.memory * message_size * (num_gpus - 1) / num_gpus / p2p_bw * 1000
             return sol_time, 0, sol_time
+        
+        def get_sol_astrasim(
+            dtype: common.CommQuantMode, num_gpus: int, operation: str, message_size: int
+        ) -> tuple[float, float, float]:
+            """
+            Get the sol time, sol math and sol mem for AstraSim
+            message_size: element number
+            """
+            sol_time = 0.0
+            p2p_bw = self._get_p2p_bandwidth(num_gpus)
 
+            if operation == "all_gather" or operation == "alltoall" or operation == "reduce_scatter":
+                sol_time = dtype.value.memory * message_size * (num_gpus - 1) / num_gpus / p2p_bw * 1000
+            elif operation == "all_reduce":
+                sol_time = 2 * dtype.value.memory * message_size * (num_gpus - 1) / num_gpus / p2p_bw * 1000
+            return sol_time, 0, sol_time
+        
         def get_empirical(dtype: common.CommQuantMode, num_gpus: int, operation: str, message_size: int) -> float:
             """
             Get the empirical time
