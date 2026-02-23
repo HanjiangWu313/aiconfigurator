@@ -272,6 +272,14 @@ class BaseModel:
     Base model class.
     """
 
+    # Default attention-stage components for AFD classification.
+    # Subclasses may override this set to adapt to their own architecture
+    # (e.g., DeepSeek MLA has extra bmm ops, NemotronH has mamba layers).
+    _ATTN_COMPONENTS = {
+        "embedding", "add_norm_1", "qkv_gemm", "attention", "proj_gemm",
+        "ar_1", "p2p",
+    }
+
     def __init__(
         self,
         model_path: str,
@@ -293,6 +301,13 @@ class BaseModel:
         self.config = model_config
         self.context_ops = []
         self.generation_ops = []
+
+        # AFD op lists – populated by _build_afd_op_lists() at the end of
+        # each subclass __init__ (after all ops are appended).
+        self.context_attn_ops: list = []
+        self.context_ffn_ops: list = []
+        self.generation_attn_ops: list = []
+        self.generation_ffn_ops: list = []
 
         # internal only
         self._num_layers = num_layers
@@ -318,6 +333,35 @@ class BaseModel:
 
         self._nextn = model_config.nextn
         self._nextn_accept_rates = model_config.nextn_accept_rates
+
+    # ------------------------------------------------------------------
+    # AFD (Attention-FFN Disaggregation) helpers
+    # ------------------------------------------------------------------
+    def _is_attn_op(self, op_name: str) -> bool:
+        """Return ``True`` if *op_name* belongs to the attention stage.
+
+        The phase prefix (``context_`` / ``generation_``) is stripped first;
+        the bare component name is then looked up in :attr:`_ATTN_COMPONENTS`.
+        Subclasses can override :attr:`_ATTN_COMPONENTS` **or** this method
+        to customise the classification for their architecture.
+        """
+        name = op_name
+        for pfx in ("context_", "generation_"):
+            if name.startswith(pfx):
+                name = name[len(pfx):]
+                break
+        return name in self._ATTN_COMPONENTS
+
+    def _build_afd_op_lists(self) -> None:
+        """Partition ``context_ops`` / ``generation_ops`` into attn vs ffn lists.
+
+        Must be called at the **end** of each subclass ``__init__``, after all
+        operations have been appended to ``context_ops`` / ``generation_ops``.
+        """
+        self.context_attn_ops = [op for op in self.context_ops if self._is_attn_op(op._name)]
+        self.context_ffn_ops = [op for op in self.context_ops if not self._is_attn_op(op._name)]
+        self.generation_attn_ops = [op for op in self.generation_ops if self._is_attn_op(op._name)]
+        self.generation_ffn_ops = [op for op in self.generation_ops if not self._is_attn_op(op._name)]
 
 
 class GPTModel(BaseModel):
@@ -467,6 +511,7 @@ class GPTModel(BaseModel):
         self.context_ops.append(ops.P2P("context_p2p", pp_scale_factor, h, pp_size))
         self.generation_ops.append(ops.P2P("generation_p2p", pp_scale_factor, h, pp_size))
 
+        self._build_afd_op_lists()
 
 class LLAMAModel(BaseModel):
     """
@@ -616,6 +661,7 @@ class LLAMAModel(BaseModel):
         self.context_ops.append(ops.P2P("context_p2p", pp_scale_factor, h, pp_size))
         self.generation_ops.append(ops.P2P("generation_p2p", pp_scale_factor, h, pp_size))
 
+        self._build_afd_op_lists()
 
 # mostly for mixtral models
 class MOEModel(BaseModel):
@@ -672,6 +718,7 @@ class MOEModel(BaseModel):
             if self.config.workload_distribution == "power_law"
             else self.config.workload_distribution
         )
+        enable_afd = self.config.enable_afd
 
         if self.architecture == "GptOssForCausalLM":
             attn_scale_factor = 2
@@ -760,6 +807,7 @@ class MOEModel(BaseModel):
                     moe_ep_size,
                     attention_dp_size,
                     True,
+                    enable_afd=enable_afd,
                 ),
                 ops.MoE(
                     "context_moe",
@@ -784,6 +832,7 @@ class MOEModel(BaseModel):
                     moe_ep_size,
                     attention_dp_size,
                     False,
+                    enable_afd=enable_afd,
                 ),
             ]
         )
@@ -845,6 +894,7 @@ class MOEModel(BaseModel):
                     moe_ep_size,
                     attention_dp_size,
                     True,
+                    enable_afd=enable_afd,
                 ),
                 ops.MoE(
                     "generation_moe",
@@ -869,9 +919,11 @@ class MOEModel(BaseModel):
                     moe_ep_size,
                     attention_dp_size,
                     False,
+                    enable_afd=enable_afd,
                 ),
             ]
         )
+
         # logits gemm
         self.generation_ops.extend(
             [
@@ -896,11 +948,19 @@ class MOEModel(BaseModel):
         self.context_ops.append(ops.P2P("context_p2p", pp_scale_factor, h, pp_size))
         self.generation_ops.append(ops.P2P("generation_p2p", pp_scale_factor, h, pp_size))
 
+        self._build_afd_op_lists()
+
 
 class DeepSeekModel(BaseModel):
     """
     DeepSeek V3/R1 uses this model impl.
     """
+
+    # MLA architecture has additional attention-stage components
+    _ATTN_COMPONENTS = BaseModel._ATTN_COMPONENTS | {
+        "downscale_gemm", "q_b_proj_gemm", "kv_b_proj_gemm",
+        "bmm_pre", "bmm_post",
+    }
 
     def __init__(self, topk: int, num_experts: int, moe_inter_size: int, *args) -> None:
         super().__init__(*args)
@@ -1297,6 +1357,8 @@ class DeepSeekModel(BaseModel):
         self.context_ops.append(ops.P2P("context_p2p", pp_scale_factor * self._mtp_scale_factor, h, pp_size))
         self.generation_ops.append(ops.P2P("generation_p2p", pp_scale_factor * self._mtp_scale_factor, h, pp_size))
 
+        self._build_afd_op_lists()
+
         # TODO
         # a lot of quantization ops
 
@@ -1314,6 +1376,10 @@ class WideEPDeepSeekModel(BaseModel):
         self._topk = topk
         self._num_experts = num_experts
         self._moe_inter_size = moe_inter_size
+        # Initialise private backing lists so the property getters work
+        # before the setters are called with real block configs.
+        self._context_ops = []
+        self._generation_ops = []
         self._mtp_scale_factor = (
             1.0
             / (1 + calc_expectation(self._nextn, self._nextn_accept_rates))
@@ -1703,6 +1769,7 @@ class NemotronNas(BaseModel):
                     common.GEMMQuantMode.float16,
                 )
             )
+            self._build_afd_op_lists()
 
     @property
     def generation_ops(self):
@@ -1822,6 +1889,7 @@ class NemotronNas(BaseModel):
                     common.GEMMQuantMode.float16,
                 )
             )
+            self._build_afd_op_lists()
 
     def _ffn_mult_to_intermediate_size(self, ffn_mult: float) -> int:
         """
@@ -1871,6 +1939,7 @@ class NemotronHModel(BaseModel):
         self._hybrid_config = hybrid_config
         self._build_context_ops()
         self._build_generation_ops()
+        self._build_afd_op_lists()
 
     def _count_layer_types(self) -> dict[str, int]:
         """Count occurrences of each layer type in the pattern."""

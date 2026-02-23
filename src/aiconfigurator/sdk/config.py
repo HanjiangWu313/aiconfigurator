@@ -32,6 +32,7 @@ class ModelConfig:
     moe_backend: str = None  # for sglang wideep only, deepep
     attention_backend: str = "flashinfer"  # 'flashinfer' or 'fa3', for sglang wideep only
     enable_wideep: bool = False
+    enable_afd: bool = False  # enable AFD (Attention-FFN Disaggregation) inter-machine communication
 
 
 @dataclass

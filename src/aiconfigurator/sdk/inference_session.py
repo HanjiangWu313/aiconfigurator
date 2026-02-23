@@ -15,38 +15,59 @@ from aiconfigurator.sdk.backends.base_backend import BaseBackend
 from aiconfigurator.sdk.inference_summary import InferenceSummary
 from aiconfigurator.sdk.utils import enumerate_ttft_tpot_constraints
 
+# Import AstraSim from astrasim_utils, which defines imports and initialization in one place
+from aiconfigurator.sdk import astrasim_utils
+
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", category=FutureWarning)
 logging.basicConfig(level=logging.INFO)
 # Get the directory of this file to build relative paths
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", "..", ".."))
+# _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+# _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", "..", ".."))
 
-# Default network config path (relative to project root)
-DEFAULT_NETWORK_CONFIG = os.path.join(_PROJECT_ROOT, "network_backend", "astra-network-analytical", "input", "Ring.yml")
+# # Default network config path (relative to project root)
+# DEFAULT_NETWORK_CONFIG = os.path.join(_PROJECT_ROOT, "network_backend", "astra-network-analytical", "input", "Ring.yml")
 
-# Network simulator library path (relative to project root)
-_NETWORK_SIM_LIB_PATH = os.path.join(_PROJECT_ROOT, "network_backend", "astra-network-analytical", "lib")
+# # Network simulator library path (relative to project root)
+# _NETWORK_SIM_LIB_PATH = os.path.join(_PROJECT_ROOT, "network_backend", "astra-network-analytical", "lib")
 
-# TODO: Turn this into input later
-USE_ASTRA_SIM = True
+# # TODO: Turn this into input later
+# USE_ASTRA_SIM = True
 
-# Attempt to import AstraSim network simulator
-sys.path.append(_NETWORK_SIM_LIB_PATH)
-try:
-    from simulation_py_congestion_aware import (
-        EventQueue,
-        Topology,
-        Chunk,
-        NetworkParser,
-        construct_topology,
-    )
-    NETWORK_SIM_AVAILABLE = True
-    print(f"AstraSim Network simulator loaded from {_NETWORK_SIM_LIB_PATH}")
-except ImportError:
-    NETWORK_SIM_AVAILABLE = False
-    print("AstraSim Network simulator not available, skipping network latency modeling")
+# # Attempt to import AstraSim network simulator
+# sys.path.append(_NETWORK_SIM_LIB_PATH)
+# try:
+#     from simulation_py_congestion_aware import (
+#         EventQueue,
+#         Topology,
+#         Chunk,
+#         NetworkParser,
+#         construct_topology,
+#     )
+#     NETWORK_SIM_AVAILABLE = True
+#     print(f"AstraSim Network simulator loaded from {_NETWORK_SIM_LIB_PATH}")
+# except ImportError:
+#     NETWORK_SIM_AVAILABLE = False
+#     print("AstraSim Network simulator not available, skipping network latency modeling")
 
+# Use centralized AstraSim imports
+NETWORK_SIM_AVAILABLE = astrasim_utils.NETWORK_SIM_AVAILABLE
+DEFAULT_NETWORK_CONFIG = astrasim_utils.DEFAULT_NETWORK_CONFIG
+
+# Import the classes/functions if available
+if NETWORK_SIM_AVAILABLE:
+    EventQueue = astrasim_utils.EventQueue
+    Topology = astrasim_utils.Topology
+    Chunk = astrasim_utils.Chunk
+    NetworkParser = astrasim_utils.NetworkParser
+    construct_topology = astrasim_utils.construct_topology
+else:
+    # Define as None if astrasim not available
+    EventQueue = None
+    Topology = None
+    Chunk = None
+    NetworkParser = None
+    construct_topology = None
 
 
 class InferenceSession:
@@ -595,8 +616,8 @@ class DisaggInferenceSession:
         decode_runtime_config.batch_size = decode_batch_size
         decode_summary = decode_sess.run_static(mode="static_gen", runtime_config=decode_runtime_config)
 
-        # # === NEW: Network simulation for KV cache transfer ===
-        # # 1. Compute KV cache size
+        # === NEW: Network simulation for KV cache transfer ===
+        # 1. Compute KV cache size
         kv_cache_size = self._compute_kv_cache_transfer_size(
             model_path=model_path,
             prefill_model_config=prefill_model_config,
@@ -605,7 +626,7 @@ class DisaggInferenceSession:
         )
         logger.info(f"KV cache transfer size: {kv_cache_size / 1e6:.2f} MB")
 
-        # # 2. Build GPU layout
+        # 2. Build GPU layout
         gpu_layout = self._build_gpu_layout(
             prefill_model_config=prefill_model_config,
             prefill_num_worker=prefill_num_worker,
@@ -614,7 +635,7 @@ class DisaggInferenceSession:
         )
         logger.info(f"GPU layout: prefill={gpu_layout['prefill_workers']}, decode={gpu_layout['decode_workers']}")
 
-        # # 3. Simulate network transfer
+        # 3. Simulate network transfer
         network_latency_ms = self._simulate_network_transfer(
             gpu_layout=gpu_layout,
             kv_cache_size=kv_cache_size,
@@ -622,7 +643,7 @@ class DisaggInferenceSession:
         )
         network_latency_ms = 0.0  # Placeholder if network sim is disabled
         # logger.info(f"Network transfer latency: {network_latency_ms:.3f} ms")
-        # # === END: Network simulation ===
+        # === END: Network simulation ===
 
         disagg_summary_df = self._get_disagg_summary_df(
             prefill_summary.get_summary_df(),
@@ -648,6 +669,149 @@ class DisaggInferenceSession:
         # }
         
         return disagg_summary
+
+    # ---- AFD (Attention-FFN Disaggregation) for disaggregated inference ----
+
+    def run_disagg_afd(
+        self,
+        model_path: str,
+        runtime_config: config.RuntimeConfig,
+        prefill_model_config: config.ModelConfig,
+        prefill_batch_size: int,
+        prefill_num_worker: int,
+        decode_model_config: config.ModelConfig,
+        decode_batch_size: int,
+        decode_num_worker: int,
+    ) -> dict:
+        """
+        Run disaggregated inference with AFD (Attention-FFN Disaggregation) breakdown.
+
+        This method performs the same work as ``run_disagg`` but additionally
+        runs every AFD sub-mode so that callers can inspect how much of each
+        phase (prefill / decode) is spent on attention vs FFN operations.
+
+        Args:
+            model_path: HuggingFace model path.
+            runtime_config: Runtime configuration (isl, osl, batch_size, …).
+            prefill_model_config: Model parallelism config for prefill workers.
+            prefill_batch_size: Batch size for each prefill worker.
+            prefill_num_worker: Number of prefill worker replicas.
+            decode_model_config: Model parallelism config for decode workers.
+            decode_batch_size: Batch size for each decode worker.
+            decode_num_worker: Number of decode worker worker replicas.
+
+        Returns:
+            dict with the following keys:
+
+            * ``"disagg_summary"`` – the full ``InferenceSummary`` (same as
+              ``run_disagg`` would return).
+            * ``"prefill_full"`` – ``InferenceSummary`` for ``static_ctx``.
+            * ``"prefill_attn"`` – ``InferenceSummary`` for ``static_ctx_attn``.
+            * ``"prefill_ffn"``  – ``InferenceSummary`` for ``static_ctx_ffn``.
+            * ``"decode_full"``  – ``InferenceSummary`` for ``static_gen``.
+            * ``"decode_attn"``  – ``InferenceSummary`` for ``static_gen_attn``.
+            * ``"decode_ffn"``   – ``InferenceSummary`` for ``static_gen_ffn``.
+            * ``"prefill_attn_pct"`` – attention share of prefill latency (%).
+            * ``"prefill_ffn_pct"``  – FFN share of prefill latency (%).
+            * ``"decode_attn_pct"``  – attention share of decode latency (%).
+            * ``"decode_ffn_pct"``   – FFN share of decode latency (%).
+        """
+        # Build models & sessions (same as run_disagg)
+        prefill_model = models.get_model(
+            model_path, prefill_model_config, self._prefill_backend.name.value
+        )
+        decode_model = models.get_model(
+            model_path, decode_model_config, self._decode_backend.name.value
+        )
+        prefill_sess = InferenceSession(
+            model=prefill_model,
+            database=self._prefill_database,
+            backend=self._prefill_backend,
+        )
+        decode_sess = InferenceSession(
+            model=decode_model,
+            database=self._decode_database,
+            backend=self._decode_backend,
+        )
+
+        # Prepare per-phase runtime configs
+        prefill_runtime_config = copy.deepcopy(runtime_config)
+        prefill_runtime_config.batch_size = prefill_batch_size
+
+        decode_runtime_config = copy.deepcopy(runtime_config)
+        decode_runtime_config.batch_size = decode_batch_size
+
+        # --- Run all six sub-modes ---
+        prefill_full = prefill_sess.run_static(
+            runtime_config=prefill_runtime_config, mode="static_ctx"
+        )
+        prefill_attn = prefill_sess.run_static(
+            runtime_config=prefill_runtime_config, mode="static_ctx_attn"
+        )
+        prefill_ffn = prefill_sess.run_static(
+            runtime_config=prefill_runtime_config, mode="static_ctx_ffn"
+        )
+
+        decode_full = decode_sess.run_static(
+            runtime_config=decode_runtime_config, mode="static_gen"
+        )
+        decode_attn = decode_sess.run_static(
+            runtime_config=decode_runtime_config, mode="static_gen_attn"
+        )
+        decode_ffn = decode_sess.run_static(
+            runtime_config=decode_runtime_config, mode="static_gen_ffn"
+        )
+
+        # --- Build the combined disagg summary (same as run_disagg) ---
+        disagg_summary_df = self._get_disagg_summary_df(
+            prefill_full.get_summary_df(),
+            prefill_num_worker,
+            decode_full.get_summary_df(),
+            decode_num_worker,
+        )
+        disagg_summary = InferenceSummary(runtime_config=runtime_config)
+        disagg_summary.set_summary_df(disagg_summary_df)
+
+        # --- Compute percentage breakdowns ---
+        prefill_total = sum(prefill_full.get_context_latency_dict().values())
+        prefill_attn_total = sum(prefill_attn.get_context_latency_dict().values())
+        prefill_ffn_total = sum(prefill_ffn.get_context_latency_dict().values())
+
+        decode_total = sum(decode_full.get_generation_latency_dict().values())
+        decode_attn_total = sum(decode_attn.get_generation_latency_dict().values())
+        decode_ffn_total = sum(decode_ffn.get_generation_latency_dict().values())
+
+        prefill_attn_pct = (
+            prefill_attn_total / prefill_total * 100.0 if prefill_total > 0 else 0.0
+        )
+        prefill_ffn_pct = (
+            prefill_ffn_total / prefill_total * 100.0 if prefill_total > 0 else 0.0
+        )
+        decode_attn_pct = (
+            decode_attn_total / decode_total * 100.0 if decode_total > 0 else 0.0
+        )
+        decode_ffn_pct = (
+            decode_ffn_total / decode_total * 100.0 if decode_total > 0 else 0.0
+        )
+
+        logger.info(
+            f"AFD Breakdown — Prefill: attn={prefill_attn_pct:.1f}% ffn={prefill_ffn_pct:.1f}%  "
+            f"Decode: attn={decode_attn_pct:.1f}% ffn={decode_ffn_pct:.1f}%"
+        )
+
+        return {
+            "disagg_summary": disagg_summary,
+            "prefill_full": prefill_full,
+            "prefill_attn": prefill_attn,
+            "prefill_ffn": prefill_ffn,
+            "decode_full": decode_full,
+            "decode_attn": decode_attn,
+            "decode_ffn": decode_ffn,
+            "prefill_attn_pct": prefill_attn_pct,
+            "prefill_ffn_pct": prefill_ffn_pct,
+            "decode_attn_pct": decode_attn_pct,
+            "decode_ffn_pct": decode_ffn_pct,
+        }
 
     # optimization
     def find_best_disagg_result_under_constraints(
@@ -968,7 +1132,7 @@ class DisaggInferenceSession:
             decode_parallel_config_list,
             decode_batch_size_range,
             runtime_config,
-            "static_gen",
+            "static_gen",  
             latency_correction_scale=self._decode_latency_correction_scale,
         )
         if len(prefill_summary_df) == 0 or len(decode_summary_df) == 0:

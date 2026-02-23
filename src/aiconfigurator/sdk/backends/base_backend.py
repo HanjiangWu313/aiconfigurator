@@ -58,14 +58,24 @@ class BaseBackend(ABC):
                 corrected latency = latency * latency_correction_scale
         """
 
-        def _run_context(batch_size: int, isl: int, prefix) -> tuple[dict[str, float], dict[str, float]]:
+        def _run_context(batch_size: int, isl: int, prefix, ops=None) -> tuple[dict[str, float], dict[str, float]]:
             """
             Run context phase.
+
+            Args:
+                ops: Op list to iterate. Defaults to ``model.context_ops``.
+                     Pass ``model.context_attn_ops`` or ``model.context_ffn_ops``
+                     for AFD sub-mode runs.
 
             Returns:
                 tuple: (context_latency_dict, context_energy_wms_dict)
                        latency in ms, energy in W·ms (watt-milliseconds)
             """
+            
+            # (default) If not set, the context will run all the ops
+            if ops is None:
+                ops = model.context_ops
+
             context_latency_dict = defaultdict(float)  # milliseconds
             context_energy_wms_dict = defaultdict(float)  # W·ms (watt-milliseconds)
 
@@ -75,7 +85,7 @@ class BaseBackend(ABC):
             if isl <= 0:
                 raise ValueError(f"isl must be greater than 0 after removing prefix, but got {isl}")
 
-            for op in model.context_ops:
+            for op in ops:
                 # query latency and store the latency
                 x = batch_size * isl if "logits_gemm" not in op._name else batch_size
                 result = op.query(database, x=x, batch_size=batch_size, beam_width=1, s=isl, prefix=prefix)
@@ -91,15 +101,23 @@ class BaseBackend(ABC):
             return context_latency_dict, context_energy_wms_dict
 
         def _run_generation(
-            batch_size: int, beam_width: int, isl: int, osl: int, stride: int
+            batch_size: int, beam_width: int, isl: int, osl: int, stride: int, ops=None
         ) -> tuple[dict[str, float], dict[str, float]]:
             """
             Run generation phase.
+
+            Args:
+                ops: Op list to iterate. Defaults to ``model.generation_ops``.
+                     Pass ``model.generation_attn_ops`` or ``model.generation_ffn_ops``
+                     for AFD sub-mode runs.
 
             Returns:
                 tuple: (generation_latency_dict, generation_energy_wms_dict)
                        latency in ms, energy in W·ms
             """
+            if ops is None:
+                ops = model.generation_ops
+
             # mtp/speculative decoding correction
             batch_size = batch_size * (model._nextn + 1)
 
@@ -110,7 +128,7 @@ class BaseBackend(ABC):
                 latency_dict = defaultdict(float)
                 energy_wms_dict = defaultdict(float)  # W·ms
 
-                for op in model.generation_ops:
+                for op in ops:
                     result = op.query(
                         database,
                         x=batch_size * beam_width,
@@ -149,7 +167,39 @@ class BaseBackend(ABC):
         context_latency_dict, context_energy_wms_dict = {}, {}
         generation_latency_dict, generation_energy_wms_dict = {}, {}
 
-        if mode == "static_ctx":
+        # ----- AFD (Attention-FFN Disaggregation) support -----
+        
+        # Match the mode to the ops list in context/generation phases
+        _afd_ctx_op_lists = {
+            "static_ctx_attn": "context_attn_ops",
+            "static_ctx_ffn": "context_ffn_ops",
+        }
+        _afd_gen_op_lists = {
+            "static_gen_attn": "generation_attn_ops",
+            "static_gen_ffn": "generation_ffn_ops",
+        }
+
+        if mode in _afd_ctx_op_lists:
+            afd_ops = getattr(model, _afd_ctx_op_lists[mode])
+            context_latency_dict, context_energy_wms_dict = _run_context(
+                batch_size, isl, prefix, ops=afd_ops
+            )
+            memory = self._get_memory_usage(model, database, batch_size, beam_width, isl, 1)
+        elif mode in _afd_gen_op_lists:
+            afd_ops = getattr(model, _afd_gen_op_lists[mode])
+            generation_latency_dict, generation_energy_wms_dict = _run_generation(
+                batch_size, beam_width, isl, osl, stride, ops=afd_ops
+            )
+            memory = self._get_memory_usage(
+                model,
+                database,
+                batch_size,
+                beam_width,
+                isl,
+                osl,
+                num_tokens=batch_size * beam_width,
+            )
+        elif mode == "static_ctx":
             context_latency_dict, context_energy_wms_dict = _run_context(batch_size, isl, prefix)
             memory = self._get_memory_usage(model, database, batch_size, beam_width, isl, 1)
         elif mode == "static_gen":

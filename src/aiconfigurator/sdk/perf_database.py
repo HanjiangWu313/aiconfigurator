@@ -19,6 +19,31 @@ from scipy import interpolate
 from aiconfigurator.sdk import common
 from aiconfigurator.sdk.performance_result import PerformanceResult
 
+# Import AstraSim
+from aiconfigurator.sdk import astrasim_utils
+
+
+# Use centralized AstraSim imports
+NETWORK_SIM_AVAILABLE = astrasim_utils.NETWORK_SIM_AVAILABLE
+DEFAULT_NETWORK_CONFIG = astrasim_utils.DEFAULT_NETWORK_CONFIG
+
+# Import the classes/functions if available
+if NETWORK_SIM_AVAILABLE:
+    EventQueue = astrasim_utils.EventQueue
+    Topology = astrasim_utils.Topology
+    Chunk = astrasim_utils.Chunk
+    NetworkParser = astrasim_utils.NetworkParser
+    construct_topology = astrasim_utils.construct_topology
+else:
+    # Define as None if astrasim not available
+    EventQueue = None
+    Topology = None
+    Chunk = None
+    NetworkParser = None
+    construct_topology = None
+
+
+
 databases_cache = defaultdict(lambda: defaultdict(lambda: defaultdict()))
 logger = logging.getLogger(__name__)
 
@@ -3505,6 +3530,7 @@ class PerfDatabase:
                 sol_time = 2 * dtype.value.memory * message_size * (num_gpus - 1) / num_gpus / p2p_bw * 1000
             return sol_time, 0, sol_time
         
+        
         def get_sol_astrasim(
             dtype: common.CommQuantMode, num_gpus: int, operation: str, message_size: int
         ) -> tuple[float, float, float]:
@@ -3515,10 +3541,32 @@ class PerfDatabase:
             sol_time = 0.0
             p2p_bw = self._get_p2p_bandwidth(num_gpus)
 
+            def astrasim_impl():
+                network_parser=NetworkParser(DEFAULT_NETWORK_CONFIG)
+                event_queue = EventQueue()
+                # Set the event queue to accept different requests
+                Topology.set_event_queue(event_queue)
+                topology = construct_topology(network_parser)
+                npus_count = topology.get_npus_count()
+                devices_count = topology.get_devices_count()
+                request_id = 0
+                for i in range(npus_count):
+                    for j in range(devices_count):
+                        if i == j:
+                            continue
+                    chunk = Chunk.create_with_event_queue(message_size, i, j, request_id, topology, event_queue)
+                    topology.send_python(chunk)
+                    request_id += 1
+                while (not event_queue.finished()):
+                    event_queue.proceed()
+                    arrivals = event_queue.get_and_clear_arrivals()
+                    print("Arrived req_ids:", arrivals)
+                return event_queue.get_current_time()
+            
             if operation == "all_gather" or operation == "alltoall" or operation == "reduce_scatter":
-                sol_time = dtype.value.memory * message_size * (num_gpus - 1) / num_gpus / p2p_bw * 1000
+                sol_time = astrasim_impl()
             elif operation == "all_reduce":
-                sol_time = 2 * dtype.value.memory * message_size * (num_gpus - 1) / num_gpus / p2p_bw * 1000
+                sol_time = 2 * astrasim_impl()
             return sol_time, 0, sol_time
         
         def get_empirical(dtype: common.CommQuantMode, num_gpus: int, operation: str, message_size: int) -> float:
