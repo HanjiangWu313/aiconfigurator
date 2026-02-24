@@ -636,12 +636,17 @@ class DisaggInferenceSession:
         logger.info(f"GPU layout: prefill={gpu_layout['prefill_workers']}, decode={gpu_layout['decode_workers']}")
 
         # 3. Simulate network transfer
+        
         network_latency_ms = self._simulate_network_transfer(
             gpu_layout=gpu_layout,
             kv_cache_size=kv_cache_size,
             prefill_batch_size=prefill_batch_size,
         )
-        network_latency_ms = 0.0  # Placeholder if network sim is disabled
+        
+        # TODO: Currently turn off the astrasim
+        self._enable_astrasim = False
+        if not self._enable_astrasim:
+            network_latency_ms = 0.0  # Placeholder if network sim is disabled
         # logger.info(f"Network transfer latency: {network_latency_ms:.3f} ms")
         # === END: Network simulation ===
 

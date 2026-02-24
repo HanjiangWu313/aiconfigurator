@@ -320,49 +320,30 @@ class MoEDispatch(Operation):
             # Best case: all routed experts for a token land on one FFN GPU => fanout = 1
             # Worst case: spread across min(topk, N) FFN GPUs
             k_worst = max(1, min(int(self._topk), N))
-            k_avg = 0.5 * (1.0 + float(k_worst))  # average of best=1 and worst=k_worst
+            k_avg = (1.0 + float(k_worst)) / 2# average of best=1 and worst=k_worst
 
             # --------- per-GPU element loads ---------
             # Per attention GPU local elements before dispatch
             E_per_attn = E_total / M
 
             # Outgoing elements per attention GPU after routing duplication
-            # (one element may be sent to multiple FFN GPUs depending on fanout)
             E_out_per_attn = E_per_attn * k_avg
 
             # Total injected elements across all attention GPUs = E_total * k_avg
             # Balanced FFN assumption => per-FFN receive load:
-            E_in_per_ffn = (E_total * k_avg) / N
+            E_in_per_ffn = E_out_per_attn / N
 
-            # --------- element -> bytes conversion ---------
-            def elements_to_bytes(E: float) -> float:
-                # Example NVFP4 model:
-                # - FP4 payload: 4 bits/value = 0.5 B/value
-                # - scale bytes: 1 B per 16 FP4 values = 1/16 B/value
-                # Total = 0.5625 B/value
-                mode_name = getattr(dtype, "name", "")
-                if mode_name == "NVFP4":
-                    return E * (0.5 + 1.0 / 16.0)  # 0.5625 * E
-
-                # Default: dtype.value.memory is bytes/element
-                bytes_per_elem = float(dtype.value.memory)
-                return E * bytes_per_elem
-
-            B_out_per_attn = elements_to_bytes(E_out_per_attn)
-            B_in_per_ffn = elements_to_bytes(E_in_per_ffn)
+            B_in_per_ffn = E_in_per_ffn * dtype.value.memory  # bytes per attention GPU
 
             # --------- P2P timing query ---------
             # query_p2p(bytes) is assumed to return time for one GPU moving that many bytes
             # under the DB's effective bandwidth model.
-            #
-            # If your database supports peer-count-aware queries, pass peers here:
-            #   query_p2p(bytes, active_peers=N) for sender side
-            #   query_p2p(bytes, active_peers=M) for receiver side
-            t_attn = float(database.query_p2p(B_out_per_attn))  # slowest sender proxy (symmetric)
-            t_ffn = float(database.query_p2p(B_in_per_ffn))     # slowest receiver proxy (balanced)
+            
+            ## TODO: Change this to a for loop with GPU ids for communication
+            t_ffn = float(database.query_p2p(B_in_per_ffn)) * N    # slowest receiver proxy (balanced)
 
             # --------- synchronized step latency = makespan ---------
-            step_latency_ms = max(t_attn, t_ffn)
+            step_latency_ms = t_ffn
 
             # Optional startup latency (only if query_p2p does NOT already include startup)
             # 10 us = 0.01 ms
