@@ -41,6 +41,7 @@ class VLLMBackend(BaseBackend):
         b = runtime_config.batch_size
         ctx_tokens = kwargs.get("ctx_tokens")
         assert ctx_tokens is not None, "ctx_tokens is required"
+        _afd_config = kwargs.get("afd_config")
         balance_score = isl * b / ctx_tokens / osl
 
         try:
@@ -106,6 +107,7 @@ class VLLMBackend(BaseBackend):
                         batch_size=1, beam_width=1, isl=num_tokens, osl=1, prefix=prefix * np.floor(ctx_tokens / isl)
                     ),
                     mode="static_ctx",
+                    afd_config=_afd_config,
                 )
                 latency_dict = summary.get_context_latency_dict()
                 energy_wms_dict = summary.get_context_energy_wms_dict()
@@ -126,6 +128,7 @@ class VLLMBackend(BaseBackend):
                     database,
                     RuntimeConfig(batch_size=batch_size, beam_width=1, isl=num_tokens, osl=1, prefix=prefix),
                     mode="static_ctx",
+                    afd_config=_afd_config,
                 )
                 latency_dict = summary.get_context_latency_dict()
                 energy_wms_dict = summary.get_context_energy_wms_dict()
@@ -143,6 +146,7 @@ class VLLMBackend(BaseBackend):
                         database,
                         RuntimeConfig(batch_size=num_tokens, beam_width=1, isl=isl + osl // 2, osl=2),
                         mode="static_gen",
+                        afd_config=_afd_config,
                     )
                     latency_dict = summary.get_generation_latency_dict()
                     energy_wms_dict = summary.get_generation_energy_wms_dict()
@@ -172,6 +176,7 @@ class VLLMBackend(BaseBackend):
                     database,
                     RuntimeConfig(batch_size=num_tokens, beam_width=1, isl=isl + osl // 2, osl=2),
                     mode="static_gen",
+                    afd_config=_afd_config,
                 )
                 latency_dict = summary.get_generation_latency_dict()
                 energy_wms_dict = summary.get_generation_energy_wms_dict()
@@ -263,19 +268,28 @@ class VLLMBackend(BaseBackend):
                 num_tokens = num_gen_requests + ctx_tokens
             else:
                 num_tokens = ctx_tokens
-            memory = self._get_memory_usage(model, database, b, 1, isl, osl, num_tokens)
+            if model.config.enable_afd and model.config.num_attn_gpus is not None:
+                memory = self._get_afd_memory_usage(model, database, b, 1, isl, osl, num_tokens)
+            else:
+                memory = self._get_memory_usage(model, database, b, 1, isl, osl, num_tokens)
             tp = model.config.tp_size
             pp = model.config.pp_size
             dp = model.config.attention_dp_size
             moe_tp = model.config.moe_tp_size
             moe_ep = model.config.moe_ep_size
-            tokens_s_gpu = output_throughput / pp / tp / dp
+
+            # In AFD mode, attention and FFN GPUs are decoupled physical groups.
+            if model.config.enable_afd and model.config.num_attn_gpus is not None:
+                num_total_gpus = model.config.num_attn_gpus + model.config.num_ffn_gpus
+            else:
+                num_total_gpus = tp * pp * dp
+
+            tokens_s_gpu = output_throughput / num_total_gpus
             tokens_s_user = 1000 / tpot
             seq_s = request_rate
-            seq_s_gpu = seq_s / pp / tp / dp
+            seq_s_gpu = seq_s / num_total_gpus
             tokens_s = output_throughput
             request_latency = ttft + tpot * max(osl - 1, 0)
-            num_total_gpus = tp * pp * dp
             parallel = f"tp{tp}pp{pp}dp{dp}etp{moe_tp}ep{moe_ep}"
             gemm = model.config.gemm_quant_mode.name
             kvcache = model.config.kvcache_quant_mode.name
@@ -302,6 +316,8 @@ class VLLMBackend(BaseBackend):
                 "tokens/s/user": tokens_s_user,
                 "request_latency": request_latency,
                 "num_total_gpus": num_total_gpus,
+                "num_attn_gpus": model.config.num_attn_gpus,
+                "num_ffn_gpus": model.config.num_ffn_gpus,
                 "tp": tp,
                 "pp": pp,
                 "dp": dp,
@@ -364,6 +380,7 @@ class VLLMBackend(BaseBackend):
         max_batch_size = kwargs.get("max_batch_size", 512)
         ctx_stride = kwargs.get("ctx_stride", 512)
         enable_chunked_prefill = kwargs.get("enable_chunked_prefill", False)
+        _afd_config = kwargs.get("afd_config")
 
         # when b is larger than 1024, the result is not good as the data collection is not enough
         # to cover this.
@@ -415,6 +432,7 @@ class VLLMBackend(BaseBackend):
                     database=database,
                     runtime_config=RuntimeConfig(batch_size=b, isl=isl, osl=osl, prefix=prefix),
                     ctx_tokens=ctx_tokens,
+                    afd_config=_afd_config,
                 )
 
                 if summary.check_oom():
@@ -448,3 +466,18 @@ class VLLMBackend(BaseBackend):
         from aiconfigurator.sdk.backends.trtllm_backend import TRTLLMBackend
 
         return TRTLLMBackend()._get_memory_usage(model, database, batch_size, beam_width, isl, osl, num_tokens)
+
+    def _get_afd_memory_usage(
+        self,
+        model: BaseModel,
+        database: PerfDatabase,
+        batch_size: int,
+        beam_width: int,
+        isl: int,
+        osl: int,
+        num_tokens: int = 0,
+    ) -> dict[str, float]:
+        # TODO
+        from aiconfigurator.sdk.backends.trtllm_backend import TRTLLMBackend
+
+        return TRTLLMBackend()._get_afd_memory_usage(model, database, batch_size, beam_width, isl, osl, num_tokens)

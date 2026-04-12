@@ -42,6 +42,7 @@ def enumerate_parallel_config(
     is_moe: bool = False,
     backend: common.BackendName = common.BackendName.trtllm,
     enable_wideep: bool = False,
+    enable_afd: bool = False,
 ) -> list[list[int]]:
     """
     Enumerate parallel configurations based on parallel list.
@@ -58,6 +59,9 @@ def enumerate_parallel_config(
         is_moe: whether to use moe
         backend: backend name enum. Important for moe parallel enumeration as different backends
             have different moe parallel support.
+        enable_afd: when True, attention and FFN GPUs are decoupled.
+            num_total_gpus = (tp*dp + moe_tp*moe_ep) and the constraint
+            tp*dp == moe_tp*moe_ep is relaxed.
     Returns:
         parallel_config_list: list of parallel configurations
     """
@@ -68,22 +72,32 @@ def enumerate_parallel_config(
                 for dp in dp_list:
                     for moe_tp in moe_tp_list:
                         for moe_ep in moe_ep_list:
-                            if dp * tp * pp in num_gpu_list and dp * tp == moe_tp * moe_ep:  # check num gpu and width
-                                # backend specific filters
-                                # trtllm
-                                if (
-                                    backend == common.BackendName.trtllm and dp > 1 and tp > 1
-                                ):  # trtllm as trtllm don't supports attn tp > 1
+                            if enable_afd:
+                                # AFD: GPUs are decoupled — total = attn_gpus + ffn_gpus
+                                num_attn_gpus = tp * dp * pp
+                                num_ffn_gpus = moe_tp * moe_ep * pp
+                                num_total = num_attn_gpus + num_ffn_gpus
+                                if num_total not in num_gpu_list:
                                     continue
-                                # sglang
-                                elif backend == common.BackendName.sglang:
-                                    if (enable_wideep and moe_tp > 1) or (
-                                        not enable_wideep and moe_ep > 1
-                                    ):  # wideep only has ep
-                                        continue
-                                elif backend == common.BackendName.vllm:
-                                    pass  # TODO
-                                parallel_config_list.append([tp, pp, dp, moe_tp, moe_ep])
+                            else:
+                                # Non-AFD: shared GPUs, width must match
+                                if dp * tp * pp not in num_gpu_list or dp * tp != moe_tp * moe_ep:
+                                    continue
+                            # backend specific filters
+                            # trtllm
+                            if (
+                                backend == common.BackendName.trtllm and dp > 1 and tp > 1
+                            ):  # trtllm as trtllm don't supports attn tp > 1
+                                continue
+                            # sglang
+                            elif backend == common.BackendName.sglang:
+                                if (enable_wideep and moe_tp > 1) or (
+                                    not enable_wideep and moe_ep > 1
+                                ):  # wideep only has ep
+                                    continue
+                            elif backend == common.BackendName.vllm:
+                                pass  # TODO
+                            parallel_config_list.append([tp, pp, dp, moe_tp, moe_ep])
             else:
                 if tp * pp in num_gpu_list:
                     parallel_config_list.append([tp, pp, 1, 1, 1])
@@ -373,6 +387,10 @@ def _parse_hf_config_json(config: dict) -> list:
     topk = config.get("num_experts_per_tok", 0)
     num_experts = config.get("num_local_experts") or config.get("n_routed_experts") or config.get("num_experts", 0)
     moe_inter_size = config.get("moe_intermediate_size", 0)
+    # Fallback: some MoE models (e.g. Mixtral) store the per-expert FFN size
+    # under "intermediate_size" rather than "moe_intermediate_size".
+    if moe_inter_size == 0 and num_experts > 0:
+        moe_inter_size = inter_size
 
     # Handle NemotronH-specific configuration (only fields unique to NemotronH)
     extra_params = None

@@ -64,6 +64,13 @@ class InferenceSummary:
         self._generation_power_avg = 0.0
         self._e2e_power_avg = 0.0
 
+        # Network transfer tracking (disagg KV cache transfer)
+        self._network_info = {
+            "kv_cache_size_bytes": 0,
+            "kv_network_latency_ms": 0.0,
+            "gpu_layout": None,
+        }
+
         # summary dataframe
         self._summary_df = None
 
@@ -73,8 +80,14 @@ class InferenceSummary:
     def set_memory_and_check_oom(self, memory_dict: dict, mem_capacity: int) -> None:
         """
         Set memory and check oom.
+
+        For AFD (Attention-FFN Disaggregation) configs, memory_dict contains
+        per-group breakdowns (attn_total, ffn_total). OOM is checked against
+        the bottleneck group (the max of the two).
         """
         self._memory = memory_dict
+        # "total" already represents the bottleneck (max of attn/ffn) for AFD,
+        # or the single-GPU total for non-AFD.
         self._is_oom = self._memory["total"] >= (mem_capacity / (1 << 30))
 
     def set_oom(self, is_oom: bool) -> None:
@@ -252,8 +265,28 @@ class InferenceSummary:
         generation_info = "Generation breakdown:\n" + generation_latency_string
 
         mem_info = "\nMemory Usage: \n"
-        for item, memory_usage in self._memory.items():
-            mem_info += f"{item:29} {memory_usage:>8.3f} GiB\n"
+        if "bottleneck_group" in self._memory:
+            # AFD mode: show per-group breakdown
+            mem_info = "\nMemory Usage (AFD mode): \n"
+            mem_info += f"  Attention GPU group:\n"
+            mem_info += f"    {'attn_weights':25} {self._memory.get('attn_weights', 0):>8.3f} GiB\n"
+            mem_info += f"    {'attn_activations':25} {self._memory.get('attn_activations', 0):>8.3f} GiB\n"
+            mem_info += f"    {'kvcache':25} {self._memory.get('kvcache', 0):>8.3f} GiB\n"
+            mem_info += f"    {'nccl':25} {self._memory.get('nccl', 0):>8.3f} GiB\n"
+            mem_info += f"    {'others':25} {self._memory.get('others', 0):>8.3f} GiB\n"
+            mem_info += f"    {'ATTN TOTAL':25} {self._memory.get('attn_total', 0):>8.3f} GiB\n"
+            mem_info += f"  FFN GPU group:\n"
+            mem_info += f"    {'ffn_weights':25} {self._memory.get('ffn_weights', 0):>8.3f} GiB\n"
+            mem_info += f"    {'ffn_activations':25} {self._memory.get('ffn_activations', 0):>8.3f} GiB\n"
+            mem_info += f"    {'nccl':25} {self._memory.get('nccl', 0):>8.3f} GiB\n"
+            mem_info += f"    {'others':25} {self._memory.get('others', 0):>8.3f} GiB\n"
+            mem_info += f"    {'FFN TOTAL':25} {self._memory.get('ffn_total', 0):>8.3f} GiB\n"
+            mem_info += f"  Bottleneck: {self._memory.get('bottleneck_group', 'unknown')} GPU group"
+            mem_info += f" ({self._memory['total']:>8.3f} GiB)\n"
+        else:
+            for item, memory_usage in self._memory.items():
+                if isinstance(memory_usage, (int, float)):
+                    mem_info += f"{item:29} {memory_usage:>8.3f} GiB\n"
 
         return perf_info, mem_info, context_info, generation_info
 
@@ -270,6 +303,60 @@ class InferenceSummary:
         if self._summary_df is None:
             logger.warning("WARNING: summary df is not set")
         return self._summary_df
+
+    # --- Network transfer tracking (disagg KV cache transfer) ---
+
+    def set_network_info(
+        self,
+        kv_cache_size_bytes: int = 0,
+        kv_network_latency_ms: float = 0.0,
+        gpu_layout: dict | None = None,
+    ) -> None:
+        """
+        Store KV cache network transfer information for disaggregated inference.
+
+        Args:
+            kv_cache_size_bytes: Total KV cache size transferred (bytes).
+            kv_network_latency_ms: Simulated network transfer latency (ms).
+            gpu_layout: GPU layout dict from _build_gpu_layout.
+        """
+        self._network_info = {
+            "kv_cache_size_bytes": kv_cache_size_bytes,
+            "kv_network_latency_ms": kv_network_latency_ms,
+            "gpu_layout": gpu_layout,
+        }
+
+    def get_network_info(self) -> dict:
+        """
+        Get KV cache network transfer information.
+
+        Returns:
+            dict with keys:
+                - kv_cache_size_bytes (int): total bytes transferred
+                - kv_network_latency_ms (float): simulated latency in ms
+                - gpu_layout (dict | None): GPU assignment layout
+        """
+        return self._network_info
+
+    def get_kv_network_latency_ms(self) -> float:
+        """Convenience accessor for the network transfer latency (ms)."""
+        return self._network_info.get("kv_network_latency_ms", 0.0)
+
+    def get_kv_cache_transfer_pct(self) -> float:
+        """
+        Return KV cache network latency as a percentage of reported TTFT.
+
+        KV network latency is tracked separately and is not automatically
+        folded into TTFT, so this is a ratio metric for inspection.
+        """
+        net_lat = self._network_info.get("kv_network_latency_ms", 0.0)
+        if net_lat <= 0:
+            return 0.0
+        if self._summary_df is not None and "ttft" in self._summary_df.columns and len(self._summary_df) > 0:
+            ttft = float(self._summary_df.iloc[0]["ttft"])
+            if ttft > 0:
+                return net_lat / ttft * 100.0
+        return 0.0
 
     def set_result_dict(self, result_dict: dict) -> None:
         """

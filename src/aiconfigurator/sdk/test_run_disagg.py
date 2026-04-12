@@ -160,7 +160,7 @@ def test_run_disagg():
         if hasattr(summary_with_network, 'network_info'):
             print(f"\nNetwork simulation info:")
             print(f"  KV cache size: {summary_with_network.network_info.get('kv_cache_size_bytes', 0) / 1e6:.2f} MB")
-            print(f"  Network latency: {summary_with_network.network_info.get('network_latency_ms', 0):.3f} ms")
+            print(f"  Network latency: {summary_with_network.network_info.get('kv_network_latency_ms', 0):.3f} ms")
         
         # Compare results
         print("\n" + "-" * 60)

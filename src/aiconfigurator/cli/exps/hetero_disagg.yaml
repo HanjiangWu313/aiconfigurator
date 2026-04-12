@@ -33,3 +33,12 @@ exp_b200_h200:
   osl: 500 # output sequence length
   ttft: 300.0  # Target TTFT in ms
   tpot: 50.0   # Target TPOT in ms
+
+  # ---------- AFD (Attention-FFN Disaggregation) system overrides ----------
+  # Use these to run attention and FFN GPU groups on different system types.
+  # If not provided, they fall back to the parent session's system.
+  #
+  # afd_attn_system_name: "h200_sxm"          # system for attention GPUs (prefill or agg)
+  # afd_ffn_system_name: "b200_sxm"           # system for FFN GPUs (prefill or agg)
+  # decode_afd_attn_system_name: "h200_sxm"   # system for decode attention GPUs (disagg only)
+  # decode_afd_ffn_system_name: "h200_sxm"    # system for decode FFN GPUs (disagg only)

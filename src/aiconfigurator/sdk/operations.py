@@ -287,80 +287,55 @@ class MoEDispatch(Operation):
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         num_tokens = kwargs.get("x")
         volume = num_tokens * self._hidden_size
-        
-        
-        def _attn_to_ffn_m2n_p2p(
-            dtype: common.CommQuantMode,
-            attn_gpus: int,
-            ffn_gpus: int,
-            message_size: int,  # GLOBAL elements across all attention GPUs (tokens * hidden)
-            ) -> PerformanceResult: 
-            """
-            Model Attention->FFN M-to-N routing communication (synchronized step).
 
-            Assumptions
-            ----------
-            1) `message_size` is the GLOBAL activation size (in elements) across all M attention GPUs.
-            2) Each attention GPU initially owns ~1/M of the elements.
-            3) Routing duplicates traffic by a fanout factor k (heuristic based on top-k and N FFN GPUs).
-            4) FFN-side receive load is approximated as balanced across N FFN GPUs.
-            5) Step latency is a barrier/makespan:
-                max( slowest attention sender, slowest FFN receiver )
-            """
-
-            # --------- basic guards ---------
-            if attn_gpus <= 0 or ffn_gpus <= 0 or message_size <= 0:
-                return PerformanceResult(0.0, energy=0.0)
-
-            M = int(attn_gpus)
-            N = int(ffn_gpus)
-            E_total = float(message_size)  # elements
-
-            # --------- fanout heuristic (average between best and worst) ---------
-            # Best case: all routed experts for a token land on one FFN GPU => fanout = 1
-            # Worst case: spread across min(topk, N) FFN GPUs
-            k_worst = max(1, min(int(self._topk), N))
-            k_avg = (1.0 + float(k_worst)) / 2# average of best=1 and worst=k_worst
-
-            # --------- per-GPU element loads ---------
-            # Per attention GPU local elements before dispatch
-            E_per_attn = E_total / M
-
-            # Outgoing elements per attention GPU after routing duplication
-            E_out_per_attn = E_per_attn * k_avg
-
-            # Total injected elements across all attention GPUs = E_total * k_avg
-            # Balanced FFN assumption => per-FFN receive load:
-            E_in_per_ffn = E_out_per_attn / N
-
-            B_in_per_ffn = E_in_per_ffn * dtype.value.memory  # bytes per attention GPU
-
-            # --------- P2P timing query ---------
-            # query_p2p(bytes) is assumed to return time for one GPU moving that many bytes
-            # under the DB's effective bandwidth model.
-            
-            ## TODO: Change this to a for loop with GPU ids for communication
-            t_ffn = float(database.query_p2p(B_in_per_ffn)) * N    # slowest receiver proxy (balanced)
-
-            # --------- synchronized step latency = makespan ---------
-            step_latency_ms = t_ffn
-
-            # Optional startup latency (only if query_p2p does NOT already include startup)
-            # 10 us = 0.01 ms
-            step_latency_ms += 1e-2
-
-            return PerformanceResult(step_latency_ms * self._scale_factor, energy=0.0)
         _sm_version = database.system_spec["gpu"]["sm_version"]
         _num_gpus_per_node = database.system_spec["node"]["num_gpus_per_node"]
         _node_num = self.num_gpus / _num_gpus_per_node
 
-        # If enable_afd, use the new M-to-N P2P modeling
+        # ---- AFD (Attention-FFN Disaggregation) P2P path ----
+        # When enable_afd is set, replace the standard all-to-all / allgather /
+        # reduce_scatter collective with M-to-N point-to-point routing via
+        # database.query_afd_p2p().  This applies to *every* backend and covers
+        # both pre-dispatch (attn → FFN) and post-dispatch (FFN → attn).
         if self._enable_afd:
             attn_gpus = kwargs.get("num_attn_gpus")
             ffn_gpus = kwargs.get("num_ffn_gpus")
             if attn_gpus is None or ffn_gpus is None:
                 raise ValueError("Must provide num_attn_gpus and num_ffn_gpus when enable_afd is set.")
-            # return _attn_to_ffn_m2n_p2p(attn_gpus, ffn_gpus)
+
+            dtype = common.CommQuantMode.half
+            M_attn = int(attn_gpus)
+            N_ffn = int(ffn_gpus)
+            total_gpus = M_attn + N_ffn
+
+            # Global activation volume (elements) — local volume scaled up
+            E_total = float(volume * M_attn)
+
+            if self._pre_dispatch:
+                # ---- Pre-dispatch: Attn → FFN (dispatch with routing fanout) ----
+                # Each token is routed to topk experts spread across N FFN GPUs.
+                # Fanout heuristic: average between best case (1 GPU) and worst
+                # case (min(topk, N) GPUs).
+                k_worst = max(1, min(int(self._topk), N_ffn))
+                k_avg = (1.0 + float(k_worst)) / 2.0
+
+                # Per attn GPU outgoing bytes (including routing duplication)
+                sender_bytes = int((E_total / M_attn) * k_avg * dtype.value.memory)
+                # Per FFN GPU incoming bytes (balanced receive assumption)
+                receiver_bytes = int((E_total * k_avg / N_ffn) * dtype.value.memory)
+            else:
+                # ---- Post-dispatch: FFN → Attn (combine, no routing fanout) ----
+                # Each completed token result is sent back to exactly one attn GPU.
+                # Total return volume equals E_total (no duplication).
+                sender_bytes = int((E_total / N_ffn) * dtype.value.memory)
+                receiver_bytes = int((E_total / M_attn) * dtype.value.memory)
+
+            comm_latency = database.query_afd_p2p(
+                sender_bytes=sender_bytes,
+                receiver_bytes=receiver_bytes,
+                num_gpus=total_gpus,
+            )
+            return PerformanceResult(float(comm_latency) * self._scale_factor, energy=0.0)
 
         if database.backend == common.BackendName.trtllm.value:
             assert self._attention_tp_size == 1 or self._attention_dp_size == 1, (
@@ -403,7 +378,7 @@ class MoEDispatch(Operation):
                                 "alltoall",
                                 all2all_volume / 8,
                             )  # volume_scale_factor = 1/8 volume
-                            comm_latency = all2all_latency + all2all_sf_latency + 1e-2  # msg size static latency 10us
+                            comm_latency = all2all_latency + all2all_sf_latency + 1e-2  # msg size static latency 20us
                         else:
                             all_gather_volume = volume * self._attention_dp_size / 4
                             all_gather_latency = database.query_nccl(
@@ -438,10 +413,17 @@ class MoEDispatch(Operation):
                             all2all_volume = (
                                 volume * (1 + min(self._topk, self._attention_dp_size)) / 2 / 4
                             )  # nvfp4 all2all
+                            all2all_sf_latency = database.query_nccl(
+                                common.CommQuantMode.half,
+                                self.num_gpus,
+                                "alltoall",
+                                all2all_volume / 8,
+                            )  # volume_scale_factor = 1/8 volume
                             comm_latency = database.query_nccl(
                                 common.CommQuantMode.half, self.num_gpus, "alltoall", all2all_volume
-                            )
+                            ) + all2all_sf_latency + 1e-2  # msg size static latency 10us
                         else:
+                            print("Post-dispatch Using NVFP4 ReduceScatter for MoE dispatch communication, ep_size:", self._moe_ep_size, "tp_size:", self._moe_tp_size, "attention_dp_size:", self._attention_dp_size)
                             comm_latency = database.query_nccl(
                                 common.CommQuantMode.half,
                                 self.num_gpus,

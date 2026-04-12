@@ -41,6 +41,7 @@ class TRTLLMBackend(BaseBackend):
         b = runtime_config.batch_size
         ctx_tokens = kwargs.get("ctx_tokens")
         assert ctx_tokens is not None, "ctx_tokens is required"
+        _afd_config = kwargs.get("afd_config")
         balance_score = isl * b / ctx_tokens / osl
 
         try:
@@ -106,6 +107,7 @@ class TRTLLMBackend(BaseBackend):
                         batch_size=1, beam_width=1, isl=num_tokens, osl=1, prefix=prefix * np.floor(ctx_tokens / isl)
                     ),
                     mode="static_ctx",
+                    afd_config=_afd_config,
                 )
                 latency_dict = summary.get_context_latency_dict()
                 energy_wms_dict = summary.get_context_energy_wms_dict()  # CHANGED from get_context_power_dict()
@@ -126,6 +128,7 @@ class TRTLLMBackend(BaseBackend):
                     database,
                     RuntimeConfig(batch_size=batch_size, beam_width=1, isl=num_tokens, osl=1, prefix=prefix),
                     mode="static_ctx",
+                    afd_config=_afd_config,
                 )
                 latency_dict = summary.get_context_latency_dict()
                 energy_wms_dict = summary.get_context_energy_wms_dict()
@@ -143,6 +146,7 @@ class TRTLLMBackend(BaseBackend):
                         database,
                         RuntimeConfig(batch_size=num_tokens, beam_width=1, isl=isl + osl // 2, osl=2),
                         mode="static_gen",
+                        afd_config=_afd_config,
                     )
                     latency_dict = summary.get_generation_latency_dict()
                     energy_wms_dict = summary.get_generation_energy_wms_dict()
@@ -172,6 +176,7 @@ class TRTLLMBackend(BaseBackend):
                     database,
                     RuntimeConfig(batch_size=num_tokens, beam_width=1, isl=isl + osl // 2, osl=2),
                     mode="static_gen",
+                    afd_config=_afd_config,
                 )
                 latency_dict = summary.get_generation_latency_dict()
                 energy_wms_dict = summary.get_generation_energy_wms_dict()  # CHANGED
@@ -263,19 +268,28 @@ class TRTLLMBackend(BaseBackend):
                 num_tokens = num_gen_requests + ctx_tokens
             else:
                 num_tokens = ctx_tokens
-            memory = self._get_memory_usage(model, database, b, 1, isl, osl, num_tokens)
+            if model.config.enable_afd and model.config.num_attn_gpus is not None:
+                memory = self._get_afd_memory_usage(model, database, b, 1, isl, osl, num_tokens)
+            else:
+                memory = self._get_memory_usage(model, database, b, 1, isl, osl, num_tokens)
             tp = model.config.tp_size
             pp = model.config.pp_size
             dp = model.config.attention_dp_size
             moe_tp = model.config.moe_tp_size
             moe_ep = model.config.moe_ep_size
-            tokens_s_gpu = output_throughput / pp / tp / dp
+
+            # In AFD mode, attention and FFN GPUs are decoupled physical groups.
+            if model.config.enable_afd and model.config.num_attn_gpus is not None:
+                num_total_gpus = model.config.num_attn_gpus + model.config.num_ffn_gpus
+            else:
+                num_total_gpus = tp * pp * dp
+
+            tokens_s_gpu = output_throughput / num_total_gpus
             tokens_s_user = 1000 / tpot
             seq_s = request_rate
-            seq_s_gpu = seq_s / pp / tp / dp
+            seq_s_gpu = seq_s / num_total_gpus
             tokens_s = output_throughput
             request_latency = ttft + tpot * max(osl - 1, 0)
-            num_total_gpus = tp * pp * dp
             parallel = f"tp{tp}pp{pp}dp{dp}etp{moe_tp}ep{moe_ep}"
             gemm = model.config.gemm_quant_mode.name
             kvcache = model.config.kvcache_quant_mode.name
@@ -302,6 +316,8 @@ class TRTLLMBackend(BaseBackend):
                 "tokens/s/user": tokens_s_user,
                 "request_latency": request_latency,
                 "num_total_gpus": num_total_gpus,
+                "num_attn_gpus": model.config.num_attn_gpus,
+                "num_ffn_gpus": model.config.num_ffn_gpus,
                 "tp": tp,
                 "pp": pp,
                 "dp": dp,
@@ -361,9 +377,10 @@ class TRTLLMBackend(BaseBackend):
         tpot = runtime_config.tpot
         prefix = runtime_config.prefix
         top_k = kwargs.get("top_k", 1)
-        max_batch_size = kwargs.get("max_batch_size", 512)
+        max_batch_size = kwargs.get("max_batch_size", 1024)
         ctx_stride = kwargs.get("ctx_stride", 512)
         enable_chunked_prefill = kwargs.get("enable_chunked_prefill", False)
+        _afd_config = kwargs.get("afd_config")
 
         # when b is larger than 1024, the result is not good as the data collection is not enough
         # to cover this.
@@ -415,6 +432,7 @@ class TRTLLMBackend(BaseBackend):
                     database=database,
                     runtime_config=RuntimeConfig(batch_size=b, isl=isl, osl=osl, prefix=prefix),
                     ctx_tokens=ctx_tokens,
+                    afd_config=_afd_config,
                 )
 
                 if summary.check_oom():
@@ -447,7 +465,7 @@ class TRTLLMBackend(BaseBackend):
         """
         Get the memory usage of the backend.
         """
-        weights, activations, kvcache = 0.0, 0.0, 0.0
+        weights, activations, per_rank_kvcache_bytes = 0.0, 0.0, 0.0
         for op in model.context_ops:
             weights += op.get_weights()
 
@@ -503,19 +521,16 @@ class TRTLLMBackend(BaseBackend):
             activations = max(activations, 70 * 1024 * 1024)  # minimum act
         # ==== this above section is backend specific ====
 
-        if model.model_family == "DEEPSEEK":
-            kvcache_per_token = model._num_layers * 576
-        else:
-            num_kv_heads_per_gpu = (model._num_kv_heads + model.config.tp_size - 1) // model.config.tp_size
-            kvcache_per_token = num_kv_heads_per_gpu * model._head_size * model._num_layers * 2
-        # should not be divided by pp_size as you need to hold all kvcache for stages.
-        kvcache = (
-            (batch_size * isl + batch_size * beam_width * osl)
-            * model.config.kvcache_quant_mode.value.memory
-            * kvcache_per_token
+        # This is the resident KV for one TP rank. It already reflects TP sharding.
+        per_rank_kvcache_bytes = self.get_kv_cache_size_bytes_per_rank(
+            model=model,
+            batch_size=batch_size,
+            isl=isl,
+            beam_width=beam_width,
+            osl=osl,
         )
         # if 'DEEPSEEK' in model.model_path or 'MOE' in model.model_path:
-        #    kvcache = kvcache * model.config.attention_dp_size # this is incorrect. tp will
+        #    per_rank_kvcache_bytes = per_rank_kvcache_bytes * model.config.attention_dp_size
         #    duplicate the kvcache while attn_dp will not.
 
         # starting from 2.22
@@ -526,10 +541,117 @@ class TRTLLMBackend(BaseBackend):
 
         one_gib = 1 << 30
         return {
-            "total": (weights + activations + kvcache + nccl_mem + others_mem) / one_gib,
+            "total": (weights + activations + per_rank_kvcache_bytes + nccl_mem + others_mem) / one_gib,
             "weights": weights / one_gib,
             "activations": activations / one_gib,
-            "kvcache": kvcache / one_gib,
+            "kvcache": per_rank_kvcache_bytes / one_gib,
             "nccl": nccl_mem / one_gib,
             "others": others_mem / one_gib,
+        }
+
+    def _get_afd_memory_usage(
+        self,
+        model: BaseModel,
+        database: PerfDatabase,
+        batch_size: int,
+        beam_width: int,
+        isl: int,
+        osl: int,
+        num_tokens: int = 0,
+    ) -> dict[str, float]:
+        """
+        Get per-group memory usage for AFD (Attention-FFN Disaggregation) mode.
+
+        In AFD mode, attention GPUs and FFN GPUs are physically separate groups.
+        Attention GPUs hold attention weights + KV cache; FFN GPUs hold MoE/FFN weights.
+        The returned dict reports memory for both groups and the bottleneck (max).
+        """
+        # --- Weights split: attn ops vs FFN ops ---
+        attn_weights = 0.0
+        ffn_weights = 0.0
+        for op in model.context_ops:
+            w = op.get_weights()
+            if model._is_attn_op(op._name):
+                attn_weights += w
+            else:
+                ffn_weights += w
+
+        # Divide by pp_size (pipeline stages share weight across stages)
+        attn_weights /= model.config.pp_size
+        ffn_weights /= model.config.pp_size
+
+        h = model._num_heads * model._head_size
+        if num_tokens == 0:
+            num_tokens = isl * batch_size
+
+        # --- Activations split ---
+        # Attention activation: primarily from QKV projections, attention, output projection
+        # FFN activation: primarily from MoE gating, expert computation, workspace
+        # We use a simplified split: attn gets a smaller c_dict, FFN gets the MoE-heavy part.
+        if model.model_family in ("MOE", "DEEPSEEK"):
+            # For MoE models, attention activations are much smaller than FFN activations.
+            # The large c_dict values (22, 13, ...) are mostly from MoE workspace.
+            attn_c_dict = {1: 6, 2: 4, 4: 3, 8: 3}  # attention-only activations
+            ffn_c_dict = {1: 16, 2: 9, 4: 7, 8: 7}   # FFN/MoE activations
+        elif model.model_family == "LLAMA":
+            attn_c_dict = {1: 5, 2: 3, 4: 2.5, 8: 2.5}
+            ffn_c_dict = {1: 6, 2: 3.5, 4: 2.5, 8: 2.5}
+        elif model.model_family == "GPT":
+            attn_c_dict = {1: 5, 2: 3, 4: 2.5, 8: 2.5}
+            ffn_c_dict = {1: 5, 2: 3, 4: 2.5, 8: 2.5}
+        else:
+            attn_c_dict = {1: 5, 2: 3, 4: 2.5, 8: 2.5}
+            ffn_c_dict = {1: 5, 2: 3, 4: 2.5, 8: 2.5}
+
+        tp = min(model.config.tp_size, 8)
+        attn_activations = 2 * num_tokens * h * attn_c_dict[tp]
+        attn_activations = max(attn_activations, 70 * 1024 * 1024)
+
+        ffn_activations = 2 * num_tokens * h * ffn_c_dict[tp]
+        if model.model_family == "DEEPSEEK":
+            ffn_activations += (
+                num_tokens
+                * h
+                * model.config.attention_dp_size
+                * getattr(model, '_num_experts', 1)
+                * getattr(model, '_topk', 1)
+                / model.config.moe_ep_size
+                / 128
+                * 4
+            )
+            if model.config.nextn > 0:
+                ffn_activations = ffn_activations * (model.config.nextn + 1)
+        ffn_activations = max(ffn_activations, 70 * 1024 * 1024)
+
+        # --- KV cache: only on attention GPUs ---
+        per_rank_kvcache_bytes = self.get_kv_cache_size_bytes_per_rank(
+            model=model,
+            batch_size=batch_size,
+            isl=isl,
+            beam_width=beam_width,
+            osl=osl,
+        )
+
+        # --- NCCL + system memory: present on both groups ---
+        nccl_mem = database.system_spec["misc"]["nccl_mem"][min(model.config.tp_size, 8)]
+        others_mem = database.system_spec["misc"]["other_mem"]
+
+        one_gib = 1 << 30
+
+        attn_total = (attn_weights + attn_activations + per_rank_kvcache_bytes + nccl_mem + others_mem) / one_gib
+        ffn_total = (ffn_weights + ffn_activations + nccl_mem + others_mem) / one_gib
+        bottleneck = max(attn_total, ffn_total)
+
+        return {
+            "total": bottleneck,
+            "attn_total": attn_total,
+            "ffn_total": ffn_total,
+            "attn_weights": attn_weights / one_gib,
+            "ffn_weights": ffn_weights / one_gib,
+            "attn_activations": attn_activations / one_gib,
+            "ffn_activations": ffn_activations / one_gib,
+            "kvcache": per_rank_kvcache_bytes / one_gib,
+            "nccl": nccl_mem / one_gib,
+            "others": others_mem / one_gib,
+            "bottleneck_group": "attn" if attn_total >= ffn_total else "ffn",
         }

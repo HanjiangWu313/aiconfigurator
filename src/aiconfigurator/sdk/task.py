@@ -65,6 +65,10 @@ class TaskContext:
     request_latency: float | None
     enable_wideep: bool
     total_gpus: int | None
+    afd_attn_system_name: str | None = None
+    afd_ffn_system_name: str | None = None
+    decode_afd_attn_system_name: str | None = None
+    decode_afd_ffn_system_name: str | None = None
     profiles: list[str] = field(default_factory=list)
     yaml_patch: dict = field(default_factory=dict)
     yaml_mode: Literal["patch", "replace"] = "patch"
@@ -713,6 +717,10 @@ class TaskConfig:
         profiles: list[str] | None = None,
         yaml_config: dict | None = None,
         database_mode: str | None = None,
+        afd_attn_system_name: str | None = None,
+        afd_ffn_system_name: str | None = None,
+        decode_afd_attn_system_name: str | None = None,
+        decode_afd_ffn_system_name: str | None = None,
     ) -> None:
         """
         Initialize a TaskConfig object.
@@ -730,6 +738,10 @@ class TaskConfig:
             model_path: The name of the model.
             system_name: The name of the system.
             decode_system_name: The name of the decode system.
+            afd_attn_system_name: System name for AFD attention GPUs (agg/prefill). Falls back to system_name.
+            afd_ffn_system_name: System name for AFD FFN GPUs (agg/prefill). Falls back to system_name.
+            decode_afd_attn_system_name: System name for AFD attention GPUs (decode). Falls back to decode_system_name.
+            decode_afd_ffn_system_name: System name for AFD FFN GPUs (decode). Falls back to decode_system_name.
             backend_name: The name of the backend.
             backend_version: The version of the backend.
             use_specific_quant_mode: The specific quant mode to use.
@@ -786,6 +798,10 @@ class TaskConfig:
             request_latency=request_latency,
             enable_wideep=enable_wideep,
             total_gpus=total_gpus,
+            afd_attn_system_name=afd_attn_system_name,
+            afd_ffn_system_name=afd_ffn_system_name,
+            decode_afd_attn_system_name=decode_afd_attn_system_name,
+            decode_afd_ffn_system_name=decode_afd_ffn_system_name,
             profiles=effective_profiles,
             yaml_patch=yaml_patch,
             yaml_mode=yaml_mode,
@@ -794,11 +810,20 @@ class TaskConfig:
         self.config, applied_layers = TaskConfigFactory.create(ctx)
         self.config.applied_layers = applied_layers
         self.config.database_mode = database_mode  # Store in config for TaskRunner access
+        # Store AFD system names in config so TaskRunner can build AfdConfig
+        self.config.afd_attn_system_name = afd_attn_system_name
+        self.config.afd_ffn_system_name = afd_ffn_system_name
+        self.config.decode_afd_attn_system_name = decode_afd_attn_system_name
+        self.config.decode_afd_ffn_system_name = decode_afd_ffn_system_name
 
         self.serving_mode = serving_mode
         self.model_path = model_path
         self.system_name = system_name
         self.decode_system_name = decode_system_name
+        self.afd_attn_system_name = afd_attn_system_name
+        self.afd_ffn_system_name = afd_ffn_system_name
+        self.decode_afd_attn_system_name = decode_afd_attn_system_name
+        self.decode_afd_ffn_system_name = decode_afd_ffn_system_name
         self.backend_name = backend_name
         self.use_specific_quant_mode = use_specific_quant_mode
         self.enable_wideep = enable_wideep
@@ -962,6 +987,14 @@ class TaskConfig:
 
         if self.config.serving_mode == "disagg":
             printable["decode_system_name"] = self.decode_system_name
+        if self.afd_attn_system_name:
+            printable["afd_attn_system_name"] = self.afd_attn_system_name
+        if self.afd_ffn_system_name:
+            printable["afd_ffn_system_name"] = self.afd_ffn_system_name
+        if self.decode_afd_attn_system_name:
+            printable["decode_afd_attn_system_name"] = self.decode_afd_attn_system_name
+        if self.decode_afd_ffn_system_name:
+            printable["decode_afd_ffn_system_name"] = self.decode_afd_ffn_system_name
 
         printable["backend_name"] = self.backend_name
         printable["backend_version"] = self.backend_version
@@ -1040,6 +1073,64 @@ class TaskConfig:
 
 
 class TaskRunner:
+    @staticmethod
+    def _build_afd_config(
+        task_config: DefaultMunch,
+        default_database: PerfDatabase,
+        database_mode: str | None = None,
+        *,
+        decode_default_database: PerfDatabase | None = None,
+    ) -> config.AfdConfig | None:
+        """Build an ``AfdConfig`` from AFD system name overrides stored on *task_config*.
+
+        Returns ``None`` when no AFD system name override is set, which preserves
+        the existing homogeneous behaviour.
+        """
+        attn_sys = getattr(task_config, "afd_attn_system_name", None)
+        ffn_sys = getattr(task_config, "afd_ffn_system_name", None)
+        decode_attn_sys = getattr(task_config, "decode_afd_attn_system_name", None)
+        decode_ffn_sys = getattr(task_config, "decode_afd_ffn_system_name", None)
+
+        if not any([attn_sys, ffn_sys, decode_attn_sys, decode_ffn_sys]):
+            return None
+
+        def _load_db(system_name: str, ref_db: PerfDatabase) -> PerfDatabase:
+            """Load a database for *system_name*, inheriting backend/version from *ref_db*."""
+            db = copy.deepcopy(
+                get_database(
+                    system=system_name,
+                    backend=ref_db.backend,
+                    version=ref_db.version,
+                )
+            )
+            if database_mode is not None:
+                db.set_default_database_mode(common.DatabaseMode[database_mode])
+            return db
+
+        attn_db = _load_db(attn_sys, default_database) if attn_sys else None
+        ffn_db = _load_db(ffn_sys, default_database) if ffn_sys else None
+
+        # For disagg, the decode databases reference decode_default_database
+        decode_ref = decode_default_database or default_database
+        decode_attn_db = _load_db(decode_attn_sys, decode_ref) if decode_attn_sys else None
+        decode_ffn_db = _load_db(decode_ffn_sys, decode_ref) if decode_ffn_sys else None
+
+        afd_cfg = config.AfdConfig(
+            attn_database=attn_db,
+            ffn_database=ffn_db,
+        )
+
+        # For disagg, build a separate AfdConfig for decode workers
+        if decode_attn_sys or decode_ffn_sys:
+            decode_afd_cfg = config.AfdConfig(
+                attn_database=decode_attn_db,
+                ffn_database=decode_ffn_db,
+            )
+        else:
+            decode_afd_cfg = None
+
+        return afd_cfg, decode_afd_cfg
+
     def run_agg(self, task_config: DefaultMunch) -> dict[str, pd.DataFrame | None]:
         logger.info("Task %s: Setting up runtime config", task_config.task_name)
         runtime_config = config.RuntimeConfig(
@@ -1109,6 +1200,11 @@ class TaskRunner:
                 task_config.worker_config.backend_version,
             )
             return None
+
+        # Build AfdConfig for heterogeneous AFD GPU groups (if configured)
+        afd_config_result = self._build_afd_config(task_config, database, database_mode=getattr(task_config, "database_mode", None))
+        afd_config = afd_config_result[0] if afd_config_result else None
+
         logger.info("Task %s: Running agg pareto", task_config.task_name)
         result_df = pa.agg_pareto(
             model_path=task_config.model_path,
@@ -1117,9 +1213,48 @@ class TaskRunner:
             backend_name=task_config.worker_config.backend_name,
             model_config=model_config,
             parallel_config_list=parallel_config_list,
+            afd_config=afd_config,
         )
+
+        # Also run AFD (Attention-FFN Disaggregation) pareto analysis for MoE models.
+        # Re-enumerate parallel configs with enable_afd=True so that
+        # num_attn_gpus and num_ffn_gpus can differ (decoupled GPU groups).
+        afd_pareto_df = None
+        if check_is_moe(task_config.model_path):
+            try:
+                logger.info("Task %s: Running agg AFD pareto", task_config.task_name)
+                afd_parallel_config_list = enumerate_parallel_config(
+                    num_gpu_list=task_config.worker_config.num_gpu_per_worker,
+                    tp_list=task_config.worker_config.tp_list,
+                    pp_list=task_config.worker_config.pp_list,
+                    dp_list=task_config.worker_config.dp_list,
+                    moe_tp_list=task_config.worker_config.moe_tp_list,
+                    moe_ep_list=task_config.worker_config.moe_ep_list,
+                    is_moe=True,
+                    backend=common.BackendName(task_config.worker_config.backend_name),
+                    enable_wideep=task_config.enable_wideep,
+                    enable_afd=True,
+                )
+                afd_pareto_df = pa.agg_afd_pareto(
+                    model_path=task_config.model_path,
+                    runtime_config=runtime_config,
+                    database=database,
+                    backend_name=task_config.worker_config.backend_name,
+                    model_config=model_config,
+                    parallel_config_list=afd_parallel_config_list,
+                    afd_config=afd_config,
+                )
+                logger.info(
+                    "Task %s: Agg AFD pareto completed with %d results.",
+                    task_config.task_name,
+                    len(afd_pareto_df) if afd_pareto_df is not None else 0,
+                )
+            except Exception:
+                logger.exception("Task %s: Agg AFD pareto analysis failed, skipping.", task_config.task_name)
+
         return {
             "pareto_df": result_df,
+            "afd_pareto_df": afd_pareto_df,
         }
 
     def run_disagg(self, task_config: DefaultMunch) -> dict[str, pd.DataFrame | None]:
@@ -1256,7 +1391,17 @@ class TaskRunner:
             return None
 
         logger.info("Task %s: Running disagg pareto", task_config.task_name)
-        result_df = pa.disagg_pareto(
+
+        # Build AfdConfig for heterogeneous AFD GPU groups (if configured)
+        afd_config_result = self._build_afd_config(
+            task_config, prefill_database,
+            database_mode=database_mode,
+            decode_default_database=decode_database,
+        )
+        prefill_afd_config = afd_config_result[0] if afd_config_result else None
+        decode_afd_config = afd_config_result[1] if afd_config_result else None
+
+        disagg_kwargs = dict(
             model_path=task_config.model_path,
             runtime_config=runtime_config,
             prefill_database=prefill_database,
@@ -1276,8 +1421,55 @@ class TaskRunner:
             decode_max_num_tokens=task_config.advanced_tuning_config.decode_max_batch_size,
             prefill_latency_correction_scale=task_config.advanced_tuning_config.prefill_latency_correction_scale,
             decode_latency_correction_scale=task_config.advanced_tuning_config.decode_latency_correction_scale,
+            prefill_afd_config=prefill_afd_config,
+            decode_afd_config=decode_afd_config,
         )
-        return {"pareto_df": result_df}
+        result_df = pa.disagg_pareto(**disagg_kwargs)
+
+        # Also run AFD (Attention-FFN Disaggregation) pareto analysis
+        # Re-enumerate parallel configs with enable_afd=True so that
+        # num_attn_gpus and num_ffn_gpus can differ (decoupled GPU groups).
+        afd_pareto_df = None
+        if check_is_moe(task_config.model_path):
+            try:
+                logger.info("Task %s: Running disagg AFD pareto", task_config.task_name)
+                afd_prefill_parallel_config_list = enumerate_parallel_config(
+                    num_gpu_list=task_config.prefill_worker_config.num_gpu_per_worker,
+                    tp_list=task_config.prefill_worker_config.tp_list,
+                    pp_list=task_config.prefill_worker_config.pp_list,
+                    dp_list=task_config.prefill_worker_config.dp_list,
+                    moe_tp_list=task_config.prefill_worker_config.moe_tp_list,
+                    moe_ep_list=task_config.prefill_worker_config.moe_ep_list,
+                    is_moe=True,
+                    backend=common.BackendName(task_config.prefill_worker_config.backend_name),
+                    enable_wideep=task_config.enable_wideep,
+                    enable_afd=True,
+                )
+                afd_decode_parallel_config_list = enumerate_parallel_config(
+                    num_gpu_list=task_config.decode_worker_config.num_gpu_per_worker,
+                    tp_list=task_config.decode_worker_config.tp_list,
+                    pp_list=task_config.decode_worker_config.pp_list,
+                    dp_list=task_config.decode_worker_config.dp_list,
+                    moe_tp_list=task_config.decode_worker_config.moe_tp_list,
+                    moe_ep_list=task_config.decode_worker_config.moe_ep_list,
+                    is_moe=True,
+                    backend=common.BackendName(task_config.decode_worker_config.backend_name),
+                    enable_wideep=task_config.enable_wideep,
+                    enable_afd=True,
+                )
+                afd_kwargs = dict(disagg_kwargs)
+                afd_kwargs["prefill_parallel_config_list"] = afd_prefill_parallel_config_list
+                afd_kwargs["decode_parallel_config_list"] = afd_decode_parallel_config_list
+                afd_pareto_df = pa.disagg_afd_pareto(**afd_kwargs)
+                logger.info(
+                    "Task %s: AFD pareto completed with %d results.",
+                    task_config.task_name,
+                    len(afd_pareto_df) if afd_pareto_df is not None else 0,
+                )
+            except Exception:
+                logger.exception("Task %s: AFD pareto analysis failed, skipping.", task_config.task_name)
+
+        return {"pareto_df": result_df, "afd_pareto_df": afd_pareto_df}
 
     def run(self, task_config: TaskConfig) -> dict[str, pd.DataFrame | None]:
         serving_mode = task_config.config.serving_mode

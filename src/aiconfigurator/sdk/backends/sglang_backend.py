@@ -39,6 +39,7 @@ class SGLANGBackend(BaseBackend):
         b = runtime_config.batch_size
         ctx_tokens = kwargs.get("ctx_tokens")
         assert ctx_tokens is not None, "ctx_tokens is required"
+        _afd_config = kwargs.get("afd_config")
         balance_score = isl * b / ctx_tokens / osl
 
         try:
@@ -104,6 +105,7 @@ class SGLANGBackend(BaseBackend):
                         batch_size=1, beam_width=1, isl=num_tokens, osl=1, prefix=prefix * np.floor(ctx_tokens / isl)
                     ),
                     mode="static_ctx",
+                    afd_config=_afd_config,
                 )
                 latency_dict = summary.get_context_latency_dict()
                 energy_wms_dict = summary.get_context_energy_wms_dict()
@@ -124,6 +126,7 @@ class SGLANGBackend(BaseBackend):
                     database,
                     RuntimeConfig(batch_size=batch_size, beam_width=1, isl=num_tokens, osl=1, prefix=prefix),
                     mode="static_ctx",
+                    afd_config=_afd_config,
                 )
                 latency_dict = summary.get_context_latency_dict()
                 energy_wms_dict = summary.get_context_energy_wms_dict()
@@ -139,6 +142,7 @@ class SGLANGBackend(BaseBackend):
                         database,
                         RuntimeConfig(batch_size=num_tokens, beam_width=1, isl=isl + osl // 2, osl=2),
                         mode="static_gen",
+                        afd_config=_afd_config,
                     )
                     latency_dict = summary.get_generation_latency_dict()
                     energy_wms_dict = summary.get_generation_energy_wms_dict()
@@ -171,6 +175,7 @@ class SGLANGBackend(BaseBackend):
                     database,
                     RuntimeConfig(batch_size=num_tokens, beam_width=1, isl=isl + osl // 2, osl=2),
                     mode="static_gen",
+                    afd_config=_afd_config,
                 )
                 latency_dict = summary.get_generation_latency_dict()
                 energy_wms_dict = summary.get_generation_energy_wms_dict()
@@ -262,19 +267,28 @@ class SGLANGBackend(BaseBackend):
                 num_tokens = num_gen_requests + ctx_tokens
             else:
                 num_tokens = ctx_tokens
-            memory = self._get_memory_usage(model, database, b, 1, isl, osl, num_tokens)
+            if model.config.enable_afd and model.config.num_attn_gpus is not None:
+                memory = self._get_afd_memory_usage(model, database, b, 1, isl, osl, num_tokens)
+            else:
+                memory = self._get_memory_usage(model, database, b, 1, isl, osl, num_tokens)
             tp = model.config.tp_size
             pp = model.config.pp_size
             dp = model.config.attention_dp_size
             moe_tp = model.config.moe_tp_size
             moe_ep = model.config.moe_ep_size
-            tokens_s_gpu = output_throughput / pp / tp / dp
+
+            # In AFD mode, attention and FFN GPUs are decoupled physical groups.
+            if model.config.enable_afd and model.config.num_attn_gpus is not None:
+                num_total_gpus = model.config.num_attn_gpus + model.config.num_ffn_gpus
+            else:
+                num_total_gpus = tp * pp * dp
+
+            tokens_s_gpu = output_throughput / num_total_gpus
             tokens_s_user = 1000 / tpot
             seq_s = request_rate
-            seq_s_gpu = seq_s / pp / tp / dp
+            seq_s_gpu = seq_s / num_total_gpus
             tokens_s = output_throughput
             request_latency = ttft + tpot * max(osl - 1, 0)
-            num_total_gpus = tp * pp * dp
             parallel = f"tp{tp}pp{pp}dp{dp}etp{moe_tp}ep{moe_ep}"
             gemm = model.config.gemm_quant_mode.name
             kvcache = model.config.kvcache_quant_mode.name
@@ -301,6 +315,8 @@ class SGLANGBackend(BaseBackend):
                 "tokens/s/user": tokens_s_user,
                 "request_latency": request_latency,
                 "num_total_gpus": num_total_gpus,
+                "num_attn_gpus": model.config.num_attn_gpus,
+                "num_ffn_gpus": model.config.num_ffn_gpus,
                 "tp": tp,
                 "pp": pp,
                 "dp": dp,
@@ -363,6 +379,7 @@ class SGLANGBackend(BaseBackend):
         max_batch_size = kwargs.get("max_batch_size", 512)
         ctx_stride = kwargs.get("ctx_stride", 512)
         enable_chunked_prefill = kwargs.get("enable_chunked_prefill", False)
+        _afd_config = kwargs.get("afd_config")
 
         # when b is larger than 1024, the result is not good as the data collection is not enough
         # to cover this.
@@ -414,6 +431,7 @@ class SGLANGBackend(BaseBackend):
                     database=database,
                     runtime_config=RuntimeConfig(batch_size=b, isl=isl, osl=osl, prefix=prefix),
                     ctx_tokens=ctx_tokens,
+                    afd_config=_afd_config,
                 )
 
                 if summary.check_oom():
@@ -505,16 +523,12 @@ class SGLANGBackend(BaseBackend):
         activations += sglang_overhead
 
         # ==== KV Cache calculation - SGLANG specific ====
-        if model.model_family == "DEEPSEEK":
-            kvcache_per_token = model._num_layers * 576
-        else:
-            num_kv_heads_per_gpu = (model._num_kv_heads + model.config.tp_size - 1) // model.config.tp_size
-            kvcache_per_token = num_kv_heads_per_gpu * model._head_size * model._num_layers * 2
-
-        kvcache = (
-            (batch_size * isl + batch_size * beam_width * osl)
-            * model.config.kvcache_quant_mode.value.memory
-            * kvcache_per_token
+        per_rank_kvcache_bytes = self.get_kv_cache_size_bytes_per_rank(
+            model=model,
+            batch_size=batch_size,
+            isl=isl,
+            beam_width=beam_width,
+            osl=osl,
         )
 
         # ==== Communication and system memory ====
@@ -528,10 +542,72 @@ class SGLANGBackend(BaseBackend):
 
         one_gib = 1 << 30
         return {
-            "total": (weights + activations + kvcache + nccl_mem + others_mem) / one_gib,
+            "total": (weights + activations + per_rank_kvcache_bytes + nccl_mem + others_mem) / one_gib,
             "weights": weights / one_gib,
             "activations": activations / one_gib,
-            "kvcache": kvcache / one_gib,
+            "kvcache": per_rank_kvcache_bytes / one_gib,
             "nccl": nccl_mem / one_gib,
             "others": others_mem / one_gib,
+        }
+
+    def _get_afd_memory_usage(
+        self,
+        model: BaseModel,
+        database: PerfDatabase,
+        batch_size: int,
+        beam_width: int,
+        isl: int,
+        osl: int,
+        num_tokens: int = 0,
+    ) -> dict[str, float]:
+        """
+        Get per-group memory usage for AFD (Attention-FFN Disaggregation) mode.
+
+        In AFD mode, attention GPUs and FFN GPUs are physically separate groups.
+        Attention GPUs hold attention weights + KV cache; FFN GPUs hold MoE/FFN weights.
+        The returned dict reports memory for both groups and the bottleneck (max).
+        """
+        # Delegate to TRTLLM implementation with sglang-specific overheads applied
+        from aiconfigurator.sdk.backends.trtllm_backend import TRTLLMBackend
+
+        base_result = TRTLLMBackend()._get_afd_memory_usage(
+            model, database, batch_size, beam_width, isl, osl, num_tokens
+        )
+
+        # Apply SGLANG-specific overhead factors (matching _get_memory_usage ratios)
+        sglang_act_overhead = 1.15  # 15% higher activations
+        sglang_sys_overhead = 1.20  # 20% higher system overhead
+
+        one_gib = 1 << 30
+        attn_act_adjusted = base_result["attn_activations"] * sglang_act_overhead
+        ffn_act_adjusted = base_result["ffn_activations"] * sglang_act_overhead
+        others_adjusted = base_result["others"] * sglang_sys_overhead
+
+        attn_total = (
+            base_result["attn_weights"]
+            + attn_act_adjusted
+            + base_result["kvcache"]
+            + base_result["nccl"]
+            + others_adjusted
+        )
+        ffn_total = (
+            base_result["ffn_weights"]
+            + ffn_act_adjusted
+            + base_result["nccl"]
+            + others_adjusted
+        )
+        bottleneck = max(attn_total, ffn_total)
+
+        return {
+            "total": bottleneck,
+            "attn_total": attn_total,
+            "ffn_total": ffn_total,
+            "attn_weights": base_result["attn_weights"],
+            "ffn_weights": base_result["ffn_weights"],
+            "attn_activations": attn_act_adjusted,
+            "ffn_activations": ffn_act_adjusted,
+            "kvcache": base_result["kvcache"],
+            "nccl": base_result["nccl"],
+            "others": others_adjusted,
+            "bottleneck_group": "attn" if attn_total >= ffn_total else "ffn",
         }

@@ -262,6 +262,8 @@ ColumnsStatic = [
     "context_latency",
     "generation_latency",
     "num_total_gpus",
+    "num_attn_gpus",
+    "num_ffn_gpus",
     "tp",
     "pp",
     "dp",
@@ -301,6 +303,8 @@ ColumnsAgg = [
     "tokens/s/gpu",
     "tokens/s/user",
     "num_total_gpus",
+    "num_attn_gpus",
+    "num_ffn_gpus",
     "tp",
     "pp",
     "dp",
@@ -352,6 +356,10 @@ ColumnsDisagg = [
     "(p)seq/s/worker",
     "(d)seq/s/worker",
     "num_total_gpus",
+    "(p)num_attn_gpus",
+    "(p)num_ffn_gpus",
+    "(d)num_attn_gpus",
+    "(d)num_ffn_gpus",
     "(p)tp",
     "(p)pp",
     "(p)dp",
@@ -383,6 +391,8 @@ ColumnsDisagg = [
     "(d)version",
     "(d)system",
     "power_w",  # NEW: E2E weighted average power in watts
+    "kv_network_latency_ms",  # KV cache transfer latency from AstraSim (ms)
+    "kv_cache_size_bytes",  # KV cache transfer size (bytes)
 ]
 
 

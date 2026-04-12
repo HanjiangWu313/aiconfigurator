@@ -124,6 +124,30 @@ def _add_default_mode_arguments(parser):
         help="Optional end-to-end request latency target (ms). Enables request-latency optimization mode.",
     )
     parser.add_argument("--prefix", type=int, default=0, help="Prefix cache length. Default to 0.")
+    parser.add_argument(
+        "--afd_attn_system",
+        type=str,
+        default=None,
+        help="System name for AFD attention GPUs (agg/prefill). Defaults to --system if omitted.",
+    )
+    parser.add_argument(
+        "--afd_ffn_system",
+        type=str,
+        default=None,
+        help="System name for AFD FFN GPUs (agg/prefill). Defaults to --system if omitted.",
+    )
+    parser.add_argument(
+        "--decode_afd_attn_system",
+        type=str,
+        default=None,
+        help="System name for AFD attention GPUs (decode). Defaults to --decode_system if omitted.",
+    )
+    parser.add_argument(
+        "--decode_afd_ffn_system",
+        type=str,
+        default=None,
+        help="System name for AFD FFN GPUs (decode). Defaults to --decode_system if omitted.",
+    )
 
 
 def _add_experiments_mode_arguments(parser):
@@ -260,6 +284,8 @@ def _build_default_task_configs(args) -> dict[str, TaskConfig]:
         "request_latency": args.request_latency,
         "prefix": args.prefix,
         "database_mode": args.database_mode,
+        "afd_attn_system_name": getattr(args, "afd_attn_system", None),
+        "afd_ffn_system_name": getattr(args, "afd_ffn_system", None),
     }
 
     task_configs: dict[str, TaskConfig] = {}
@@ -268,6 +294,8 @@ def _build_default_task_configs(args) -> dict[str, TaskConfig]:
 
     disagg_kwargs = dict(common_kwargs)
     disagg_kwargs["decode_system_name"] = decode_system
+    disagg_kwargs["decode_afd_attn_system_name"] = getattr(args, "decode_afd_attn_system", None)
+    disagg_kwargs["decode_afd_ffn_system_name"] = getattr(args, "decode_afd_ffn_system", None)
     disagg_task = TaskConfig(serving_mode="disagg", **disagg_kwargs)
     task_configs["disagg"] = disagg_task
 
@@ -292,6 +320,10 @@ _EXPERIMENT_RESERVED_KEYS = {
     "total_gpus",
     "use_specific_quant_mode",
     "database_mode",
+    "afd_attn_system_name",
+    "afd_ffn_system_name",
+    "decode_afd_attn_system_name",
+    "decode_afd_ffn_system_name",
 }
 
 
@@ -396,6 +428,16 @@ def _build_experiment_task_configs(args) -> dict[str, TaskConfig]:
         if serving_mode == "disagg":
             task_kwargs["decode_system_name"] = inferred_decode_system or system_name
 
+        # AFD system name overrides (attention/FFN disaggregation)
+        for afd_key in (
+            "afd_attn_system_name",
+            "afd_ffn_system_name",
+            "decode_afd_attn_system_name",
+            "decode_afd_ffn_system_name",
+        ):
+            if afd_key in exp_config:
+                task_kwargs[afd_key] = exp_config[afd_key]
+
         # Per-experiment overrides for runtime numeric parameters if provided at top level
         for numeric_key in ("isl", "osl", "ttft", "tpot", "request_latency"):
             if numeric_key in exp_config:
@@ -435,7 +477,7 @@ def _execute_task_configs(
     runner = TaskRunner()
 
     # TODO, can run in parallel
-    for exp_name, task_config in task_configs.items():
+    for exp_name, task_config in list(task_configs.items()):
         try:
             logger.info("Starting experiment: %s", exp_name)
             logger.info("Task config: %s", task_config.pretty())
@@ -447,6 +489,16 @@ def _execute_task_configs(
             else:
                 logger.warning(
                     "Experiment %s returned no results. The TTFT and TPOT constraints may need to be relaxed.", exp_name
+                )
+            # Register AFD results as a separate experiment if available
+            afd_pareto_df = task_result.get("afd_pareto_df") if task_result else None
+            if afd_pareto_df is not None and not afd_pareto_df.empty:
+                afd_exp_name = f"{exp_name}_afd"
+                results[afd_exp_name] = {"pareto_df": afd_pareto_df}
+                # Mirror the task config so downstream logic can look it up
+                task_configs[afd_exp_name] = task_config
+                logger.info(
+                    "Experiment %s (AFD) completed with %d results.", afd_exp_name, len(afd_pareto_df)
                 )
         except Exception:
             logger.exception("Error running experiment %s", exp_name)

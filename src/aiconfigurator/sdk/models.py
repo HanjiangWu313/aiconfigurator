@@ -280,6 +280,14 @@ class BaseModel:
         "ar_1", "p2p",
     }
 
+    # 4-stage AFD pipeline classification.
+    # Stage 2 (comm attn→FFN): ops that transfer activations from attn to FFN GPUs.
+    # Stage 4 (comm FFN→attn): ops that transfer activations from FFN back to attn GPUs.
+    # Everything else in attn group → Stage 1 (attn compute).
+    # Everything else in FFN group → Stage 3 (FFN compute).
+    _COMM_A2F_COMPONENTS = {"moe_pre_dispatch"}
+    _COMM_F2A_COMPONENTS = {"moe_post_dispatch"}
+
     def __init__(
         self,
         model_path: str,
@@ -309,6 +317,16 @@ class BaseModel:
         self.generation_attn_ops: list = []
         self.generation_ffn_ops: list = []
 
+        # 4-stage AFD pipeline op lists (also populated by _build_afd_op_lists)
+        self.context_attn_compute_ops: list = []   # Stage 1
+        self.context_comm_a2f_ops: list = []        # Stage 2
+        self.context_ffn_compute_ops: list = []     # Stage 3
+        self.context_comm_f2a_ops: list = []         # Stage 4
+        self.generation_attn_compute_ops: list = [] # Stage 1
+        self.generation_comm_a2f_ops: list = []      # Stage 2
+        self.generation_ffn_compute_ops: list = []   # Stage 3
+        self.generation_comm_f2a_ops: list = []       # Stage 4
+
         # internal only
         self._num_layers = num_layers
         self._num_heads = num_heads
@@ -337,6 +355,13 @@ class BaseModel:
     # ------------------------------------------------------------------
     # AFD (Attention-FFN Disaggregation) helpers
     # ------------------------------------------------------------------
+    def _strip_phase_prefix(self, op_name: str) -> str:
+        """Strip ``context_`` or ``generation_`` prefix from *op_name*."""
+        for pfx in ("context_", "generation_"):
+            if op_name.startswith(pfx):
+                return op_name[len(pfx):]
+        return op_name
+
     def _is_attn_op(self, op_name: str) -> bool:
         """Return ``True`` if *op_name* belongs to the attention stage.
 
@@ -345,23 +370,49 @@ class BaseModel:
         Subclasses can override :attr:`_ATTN_COMPONENTS` **or** this method
         to customise the classification for their architecture.
         """
-        name = op_name
-        for pfx in ("context_", "generation_"):
-            if name.startswith(pfx):
-                name = name[len(pfx):]
-                break
-        return name in self._ATTN_COMPONENTS
+        return self._strip_phase_prefix(op_name) in self._ATTN_COMPONENTS
+
+    def _is_comm_a2f_op(self, op_name: str) -> bool:
+        """Return ``True`` if *op_name* is an attn→FFN communication op (Stage 2)."""
+        return self._strip_phase_prefix(op_name) in self._COMM_A2F_COMPONENTS
+
+    def _is_comm_f2a_op(self, op_name: str) -> bool:
+        """Return ``True`` if *op_name* is a FFN→attn communication op (Stage 4)."""
+        return self._strip_phase_prefix(op_name) in self._COMM_F2A_COMPONENTS
 
     def _build_afd_op_lists(self) -> None:
-        """Partition ``context_ops`` / ``generation_ops`` into attn vs ffn lists.
+        """Partition ``context_ops`` / ``generation_ops`` into attn vs ffn lists,
+        and further into 4-stage AFD pipeline lists.
 
         Must be called at the **end** of each subclass ``__init__``, after all
         operations have been appended to ``context_ops`` / ``generation_ops``.
         """
+        # 2-group partition (attn vs FFN)
         self.context_attn_ops = [op for op in self.context_ops if self._is_attn_op(op._name)]
         self.context_ffn_ops = [op for op in self.context_ops if not self._is_attn_op(op._name)]
         self.generation_attn_ops = [op for op in self.generation_ops if self._is_attn_op(op._name)]
         self.generation_ffn_ops = [op for op in self.generation_ops if not self._is_attn_op(op._name)]
+
+        # 4-stage partition for AFD pipeline:
+        #   Stage 1 (attn compute): attn ops that are NOT comm
+        #   Stage 2 (comm a→f):     ops matching _COMM_A2F_COMPONENTS
+        #   Stage 3 (ffn compute):   ffn ops that are NOT comm
+        #   Stage 4 (comm f→a):      ops matching _COMM_F2A_COMPONENTS
+        for phase, ops_list in [("context", self.context_ops), ("generation", self.generation_ops)]:
+            s1, s2, s3, s4 = [], [], [], []
+            for op in ops_list:
+                if self._is_comm_a2f_op(op._name):
+                    s2.append(op)
+                elif self._is_comm_f2a_op(op._name):
+                    s4.append(op)
+                elif self._is_attn_op(op._name):
+                    s1.append(op)
+                else:
+                    s3.append(op)
+            setattr(self, f"{phase}_attn_compute_ops", s1)
+            setattr(self, f"{phase}_comm_a2f_ops", s2)
+            setattr(self, f"{phase}_ffn_compute_ops", s3)
+            setattr(self, f"{phase}_comm_f2a_ops", s4)
 
 
 class GPTModel(BaseModel):
@@ -678,14 +729,25 @@ class MOEModel(BaseModel):
         super().__init__(*args)
         assert self._nextn == 0, "Only DS V3 supports mtp"
 
-        # make sure the paralel width is same
-        assert (
-            self.config.tp_size * self.config.attention_dp_size == self.config.moe_tp_size * self.config.moe_ep_size
-        ), (
-            f"tp_size ({self.config.tp_size}) * attention_dp_size "
-            f"({self.config.attention_dp_size}) should be equal to moe_tp_size "
-            f"({self.config.moe_tp_size}) * moe_ep_size ({self.config.moe_ep_size})"
-        )
+        # In AFD mode attention and FFN GPUs are decoupled, so the parallel
+        # width constraint (tp*dp == moe_tp*moe_ep) does not apply.
+        if not self.config.enable_afd:
+            # make sure the paralel width is same
+            assert (
+                self.config.tp_size * self.config.attention_dp_size == self.config.moe_tp_size * self.config.moe_ep_size
+            ), (
+                f"tp_size ({self.config.tp_size}) * attention_dp_size "
+                f"({self.config.attention_dp_size}) should be equal to moe_tp_size "
+                f"({self.config.moe_tp_size}) * moe_ep_size ({self.config.moe_ep_size})"
+            )
+
+        # Auto-derive num_attn_gpus / num_ffn_gpus when AFD is enabled but
+        # the user has not set them explicitly.
+        if self.config.enable_afd:
+            if self.config.num_attn_gpus is None:
+                self.config.num_attn_gpus = self.config.tp_size * self.config.attention_dp_size
+            if self.config.num_ffn_gpus is None:
+                self.config.num_ffn_gpus = self.config.moe_tp_size * self.config.moe_ep_size
 
         assert num_experts >= self.config.moe_ep_size, f"ep size cannot be larger than num_experts {num_experts}"
         assert self.config.tp_size * self.config.attention_dp_size <= 256, (

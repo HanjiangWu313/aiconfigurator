@@ -28,6 +28,7 @@ def agg_pareto(
     backend_name: str,
     model_config: config.ModelConfig,
     parallel_config_list: list[list[int]],
+    afd_config: config.AfdConfig | None = None,
 ) -> pd.DataFrame:
     """
     Find Pareto front for agg.
@@ -70,7 +71,7 @@ def agg_pareto(
                 backend_name=backend_name,
             )
             backend = get_backend(backend_name)
-            sess = InferenceSession(model=model, database=database, backend=backend)
+            sess = InferenceSession(model=model, database=database, backend=backend, afd_config=afd_config)
 
             runtime_configs_to_evaluate: list[config.RuntimeConfig] = []
             if runtime_config.request_latency is not None and runtime_config.request_latency > 0:
@@ -139,9 +140,13 @@ def agg_pareto(
         results_df = results_df.drop_duplicates(ignore_index=True)
         results_df = results_df.sort_values(by="tokens/s/gpu", ascending=False).reset_index(drop=True)
     else:
+        if exceptions:
+            raise RuntimeError(
+                f"No results found for any parallel configuration. Showing last exception: {exceptions[-1]}"
+            ) from exceptions[-1]
         raise RuntimeError(
-            f"No results found for any parallel configuration. Showing last exception: {exceptions[-1]}"
-        ) from exceptions[-1]
+            "No results found for any parallel configuration. All configurations resulted in OOM."
+        )
 
     return results_df
 
@@ -218,7 +223,15 @@ def disagg_pareto(
     prefill_backend = get_backend(prefill_backend_name)
     decode_backend = get_backend(decode_backend_name)
 
-    disagg_sess = DisaggInferenceSession(prefill_database, prefill_backend, decode_database, decode_backend)
+    network_file = kwargs.get("network_file", None)
+    prefill_afd_config = kwargs.get("prefill_afd_config", None)
+    decode_afd_config = kwargs.get("decode_afd_config", None)
+    disagg_sess = DisaggInferenceSession(
+        prefill_database, prefill_backend, decode_database, decode_backend,
+        network_file=network_file,
+        prefill_afd_config=prefill_afd_config,
+        decode_afd_config=decode_afd_config,
+    )
     disagg_sess.set_latency_correction_scales(prefill_latency_correction_scale, decode_latency_correction_scale)
 
     prefill_max_num_tokens = kwargs.get("prefill_max_num_tokens", 16384)
@@ -260,6 +273,94 @@ def disagg_pareto(
     )
 
     return summary.get_summary_df()
+
+
+def disagg_afd_pareto(
+    model_path: str,
+    runtime_config: config.RuntimeConfig,
+    prefill_database: PerfDatabase,
+    prefill_backend_name: str,
+    prefill_model_config: config.ModelConfig,
+    prefill_parallel_config_list: list[list[int]],
+    prefill_latency_correction_scale: float,
+    decode_database: PerfDatabase,
+    decode_backend_name: str,
+    decode_model_config: config.ModelConfig,
+    decode_parallel_config_list: list[list[int]],
+    decode_latency_correction_scale: float,
+    **kwargs,
+) -> pd.DataFrame:
+    """Find Pareto front for Disaggregated Inference with AFD (Attention-FFN Disaggregation).
+
+    This is identical to :func:`disagg_pareto` except that ``enable_afd=True`` is set
+    on both prefill and decode model configurations so that MoE dispatch operations
+    use the M-to-N P2P communication model instead of the standard collective model.
+
+    All parameters are the same as :func:`disagg_pareto`.
+
+    Returns:
+        results_df: DataFrame of the AFD-enabled disagg Pareto results.
+    """
+    # Deep-copy model configs and enable AFD
+    afd_prefill_model_config = copy.deepcopy(prefill_model_config)
+    afd_prefill_model_config.enable_afd = True
+
+    afd_decode_model_config = copy.deepcopy(decode_model_config)
+    afd_decode_model_config.enable_afd = True
+
+    logger.info("Running disagg AFD pareto with enable_afd=True on both prefill and decode model configs.")
+
+    return disagg_pareto(
+        model_path=model_path,
+        runtime_config=runtime_config,
+        prefill_database=prefill_database,
+        prefill_backend_name=prefill_backend_name,
+        prefill_model_config=afd_prefill_model_config,
+        prefill_parallel_config_list=prefill_parallel_config_list,
+        prefill_latency_correction_scale=prefill_latency_correction_scale,
+        decode_database=decode_database,
+        decode_backend_name=decode_backend_name,
+        decode_model_config=afd_decode_model_config,
+        decode_parallel_config_list=decode_parallel_config_list,
+        decode_latency_correction_scale=decode_latency_correction_scale,
+        **kwargs,
+    )
+
+
+def agg_afd_pareto(
+    model_path: str,
+    runtime_config: config.RuntimeConfig,
+    database: PerfDatabase,
+    backend_name: str,
+    model_config: config.ModelConfig,
+    parallel_config_list: list[list[int]],
+    afd_config: config.AfdConfig | None = None,
+) -> pd.DataFrame:
+    """Find Pareto front for Aggregated Inference with AFD (Attention-FFN Disaggregation).
+
+    This is identical to :func:`agg_pareto` except that ``enable_afd=True`` is set
+    on the model configuration so that attention and FFN run on decoupled GPU groups
+    and MoE dispatch operations use the M-to-N P2P communication model.
+
+    All parameters are the same as :func:`agg_pareto`.
+
+    Returns:
+        results_df: DataFrame of the AFD-enabled agg Pareto results.
+    """
+    afd_model_config = copy.deepcopy(model_config)
+    afd_model_config.enable_afd = True
+
+    logger.info("Running agg AFD pareto with enable_afd=True on model config.")
+
+    return agg_pareto(
+        model_path=model_path,
+        runtime_config=runtime_config,
+        database=database,
+        backend_name=backend_name,
+        model_config=afd_model_config,
+        parallel_config_list=parallel_config_list,
+        afd_config=afd_config,
+    )
 
 
 def get_pareto_front(
