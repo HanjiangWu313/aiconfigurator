@@ -20,3 +20,10 @@ _deps
 
 # build
 build/
+
+# Built libraries and binaries
+lib/
+bin/
+
+# Auto-generated topology configs
+input/auto_generated/

@@ -13,7 +13,18 @@ endif ()
 # Setup project
 project(Analytical)
 
-include_directories("/home/hanjiang/miniconda3/envs/GenA/bin/")
+# Auto-discover pybind11 from the active Python environment
+find_program(_PYTHON3 python3)
+execute_process(
+    COMMAND "${_PYTHON3}" -c "import pybind11; print(pybind11.get_cmake_dir())"
+    OUTPUT_VARIABLE _pybind11_cmake_dir
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE _pybind11_result
+)
+if (_pybind11_result EQUAL 0 AND _pybind11_cmake_dir)
+    set(pybind11_DIR "${_pybind11_cmake_dir}" CACHE PATH "pybind11 CMake dir (auto-detected)" FORCE)
+endif ()
+
 set(PYBIND11_FINDPYTHON ON)
 find_package(pybind11 CONFIG REQUIRED)
 
