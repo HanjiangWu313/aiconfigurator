@@ -10,7 +10,6 @@ parameters and cached on disk so duplicate files are never created.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import math
 import os
@@ -93,10 +92,7 @@ def _topology_filename(
     topology: str, npus_count: int, bandwidth_gbps: float, latency_ns: float
 ) -> str:
     """Deterministic filename for a given set of topology parameters."""
-    # Use a short hash to keep names readable but collision-free
-    key = f"{topology}_{npus_count}_{bandwidth_gbps}_{latency_ns}"
-    short_hash = hashlib.md5(key.encode()).hexdigest()[:8]
-    return f"auto_{topology}_{npus_count}npus_{bandwidth_gbps}gbps_{short_hash}.yml"
+    return f"auto_{topology}_{npus_count}npus_{bandwidth_gbps}gbps_{latency_ns}ns.yml"
 
 
 def get_or_create_topology_config(
@@ -168,39 +164,27 @@ def derive_network_params_from_system_spec(
 ) -> dict:
     """Derive AstraSim topology parameters from a system YAML spec.
 
-    Supports up to **three bandwidth tiers** to accommodate different
-    system architectures:
+    Targets NVIDIA GPU systems with up to three network tiers 
+    (TODO: Update for other vendors accordingly):
 
-    * **Tier 1 – intra-node** (``intra_node_bw``):
-      NVLink within a single physical node.
-      Applies when ``num_gpus <= num_gpus_per_node``.
-    * **Tier 2 – inter-node / intra-rack** (``inter_node_bw``):
-      NVLink via NVSwitch within a rack (e.g. GB200 NVL72) or
-      InfiniBand between nodes in a 2-tier system (e.g. H100, B200).
-      Applies when ``num_gpus <= num_gpus_per_rack`` (or when there
-      is no ``num_gpus_per_rack`` key and ``num_gpus > num_gpus_per_node``).
-    * **Tier 3 – inter-rack** (``inter_rack_bw``):
-      InfiniBand between racks.  Only present on systems like GB200
-      that define ``num_gpus_per_rack`` and ``inter_rack_bw``.
-      Applies when ``num_gpus > num_gpus_per_rack``.
+    * **Tier 1 – intra-node** (``intra_node_bw``, NVLink):
+      ``num_gpus <= num_gpus_per_node`` → ``Switch``
+    * **Tier 2 – intra-rack** (``inter_node_bw``, NVSwitch, for 3-tier systems only):
+      ``num_gpus <= num_gpus_per_rack`` (3-tier systems only) → ``Switch``
+    * **Tier 3 – inter-rack / inter-node** (``inter_rack_bw`` / ``inter_node_bw``, IB):
+      all remaining cases → ``Switch``
 
-    Example tier selection for each system:
+    Tier examples:
 
-    * **H100 SXM** (NVL8, 2-tier):
-      ≤ 8 GPUs → 450 GB/s NVLink · > 8 GPUs → 25 GB/s IB
-    * **B200 SXM** (NVL8, 2-tier):
-      ≤ 8 GPUs → 900 GB/s NVLink · > 8 GPUs → 50 GB/s IB
-    * **GB200 SXM** (NVL4 + NVL72 rack, 3-tier):
-      ≤ 4 GPUs → 900 GB/s NVLink (intra-node)
-      ≤ 72 GPUs → 900 GB/s NVLink via NVSwitch (intra-rack)
-      > 72 GPUs → 25 GB/s IB (inter-rack)
+    * **H100 / B200 SXM** (NVL8, 2-tier):
+      ≤ 8 GPUs → NVLink (intra-node) · > 8 GPUs → IB (inter-node)
+    * **GB200 SXM** (NVL4 + NVL72, 3-tier):
+      ≤ 4 GPUs → NVLink (intra-node) · ≤ 72 GPUs → NVSwitch (intra-rack) · > 72 GPUs → IB (inter-rack)
 
     Args:
         system_spec: Parsed system YAML dict (must contain ``node`` key).
         num_gpus: Total number of GPUs in the topology.
-        topology: Override topology type.  ``None`` → auto-select
-            (``FullyConnected`` for intra-node, ``Ring`` / ``Switch``
-            for inter-node / inter-rack).
+        topology: Override topology type; ``None`` → auto-select per tier.
 
     Returns:
         dict with keys ``npus_count``, ``bandwidth_gbps``, ``latency_ns``,
@@ -214,7 +198,7 @@ def derive_network_params_from_system_spec(
         # ── Tier 1: intra-node (NVLink) ──────────────────────────
         bw_bytes_per_s = node["intra_node_bw"]
         latency_s = node.get("p2p_latency", 0.0)
-        auto_topology = "FullyConnected"
+        auto_topology = "Switch"
         tier = "intra-node"
 
     elif num_gpus_per_rack is not None and num_gpus <= num_gpus_per_rack:
@@ -235,7 +219,7 @@ def derive_network_params_from_system_spec(
         # ── 2-tier fallback: inter-node (IB or NVLink between nodes)
         bw_bytes_per_s = node.get("inter_node_bw", node["intra_node_bw"])
         latency_s = node.get("p2p_latency", 0.0)
-        auto_topology = "Ring"
+        auto_topology = "Switch"
         tier = "inter-node"
 
     bandwidth_gbps = bw_bytes_per_s / 1e9  # Bytes/s → GB/s
@@ -354,17 +338,20 @@ class AstraSimManager:
     # ------------------------------------------------------------------
     def _classify_tier(
         self, src_gpu: int, dst_gpu: int
-    ) -> tuple[tuple[str, int], int, int]:
+    ) -> tuple[tuple, int, int]:
         """Classify a GPU-to-GPU transfer into a network tier.
 
-        Returns ``(tier_key, local_src, local_dst)`` where:
+        Returns ``(tier_key, src_id, dst_id)`` where:
 
         * *tier_key* = ``(tier_name, group_id)`` uniquely identifies an
-          independent congestion domain.  Distinct group IDs within the
-          same tier have physically separate links, so they can't
-          congest each other (e.g. NVLink inside node 0 vs node 1).
-        * *local_src* / *local_dst* are NPU indices inside the
-          topology created for that tier+group.
+          independent fabric domain. Distinct group IDs within the same
+          tier have physically separate links, so they can't congest
+          each other (e.g. NVLink inside node 0 vs node 1).
+        * *src_id* / *dst_id* identify the communicating participants
+          inside that fabric domain. For intra-node / intra-rack tiers
+          these are already local topology indices. For inter-node /
+          inter-rack tiers they are GPU-level NIC endpoint IDs and are
+          densely remapped before the topology is built.
 
         Tier classification:
 
@@ -374,9 +361,14 @@ class AstraSimManager:
           like GB200 with ``num_gpus_per_rack``) → NVSwitch topology.
           Group = rack index.
         * **inter-node** – different nodes, 2-tier system → IB fabric.
-          Group = 0 (global).
+          Group = 0 (global inter-node fabric). Each GPU contributes a
+          dedicated NIC endpoint, so a Switch topology built over the
+          participating NICs models both source-NIC and destination-NIC
+          contention for the specific source/destination pairs present
+          in the transfer batch.
         * **inter-rack** – different racks (3-tier) → IB fabric.
-          Group = 0 (global).
+          Group = 0 (global inter-rack fabric), using the same
+          GPU-level NIC endpoint model as inter-node.
         * **flat** – no ``system_spec`` → raw GPU IDs, single topology.
         """
         if self._system_spec is None:
@@ -406,11 +398,11 @@ class AstraSimManager:
                     dst_node % npn,
                 )
             else:
-                # Inter-rack IB: global domain
-                return ("inter-rack", 0), src_rack, dst_rack
+                # Inter-rack IB: use GPU NIC endpoints in one global fabric.
+                return ("inter-rack", 0), src_gpu, dst_gpu
 
-        # 2-tier system: inter-node IB fabric (one global domain)
-        return ("inter-node", 0), src_node, dst_node
+        # 2-tier system: inter-node IB, using GPU NIC endpoints.
+        return ("inter-node", 0), src_gpu, dst_gpu
 
     def _tier_topology_params(self, tier_name: str, num_units: int) -> dict:
         """Return AstraSim topology parameters for a given tier.
@@ -437,7 +429,7 @@ class AstraSimManager:
         if tier_name == "intra-node":
             bw = node["intra_node_bw"] / 1e9
             lat = node.get("p2p_latency", 0.0) * 1e9
-            topo = "FullyConnected"
+            topo = "Switch"
         elif tier_name == "intra-rack":
             bw = node.get("inter_node_bw", node["intra_node_bw"]) / 1e9
             lat = node.get("p2p_latency", 0.0) * 1e9
@@ -499,30 +491,21 @@ class AstraSimManager:
         if not transfers:
             return 0.0
 
-        # ── 1. Group transfers by tier+group ────────────────────────
-        tier_groups: dict[tuple[str, int], list[tuple[int, int, int]]] = {}
-        for src_gpu, dst_gpu, size_bytes in transfers:
-            if src_gpu == dst_gpu:
-                continue
-            tier_key, local_src, local_dst = self._classify_tier(
-                src_gpu, dst_gpu
-            )
-            tier_groups.setdefault(tier_key, []).append(
-                (local_src, local_dst, size_bytes)
-            )
+        # ── 1. Group transfers by fabric domain ─────────────────────
+        tier_groups = self._group_tiered_transfers(transfers)
 
         if not tier_groups:
             return 0.0
 
         # ── 2. Simulate each group independently ────────────────────
-        tier_latencies: dict[tuple[str, int], float] = {}
+        tier_latencies: dict[tuple, float] = {}
 
         for tier_key, group in tier_groups.items():
             tier_name, group_id = tier_key
 
-            # Determine topology size from max local ID
-            max_local_id = max(max(s, d) for s, d, _ in group)
-            num_units = max_local_id + 1
+            remapped_group, num_units, participant_to_local = (
+                self._prepare_group_for_topology(tier_name, group)
+            )
 
             params = self._tier_topology_params(tier_name, num_units)
             config_path = get_or_create_topology_config(
@@ -540,7 +523,7 @@ class AstraSimManager:
 
             topo_size = topology.get_npus_count()
 
-            for i, (local_src, local_dst, size_bytes) in enumerate(group):
+            for i, (local_src, local_dst, size_bytes) in enumerate(remapped_group):
                 if max(local_src, local_dst) >= topo_size:
                     logger.warning(
                         f"Tier {tier_name} group {group_id}: local IDs "
@@ -566,13 +549,42 @@ class AstraSimManager:
 
             logger.debug(
                 f"Tier {tier_name} (group {group_id}): "
-                f"{len(group)} transfers → {latency_ms:.4f} ms"
+                f"{len(group)} transfers across {len(participant_to_local)} participants "
+                f"→ {latency_ms:.4f} ms"
             )
 
         # ── 3. Overall latency = slowest tier/group ─────────────────
         return max(tier_latencies.values()) if tier_latencies else 0.0
 
-    def _build_worker_transfer_plan(
+    def _group_tiered_transfers(
+        self,
+        transfers: list[tuple[int, int, int]],
+    ) -> dict[tuple, list[tuple[int, int, int]]]:
+        """Group transfers by fabric domain before simulation."""
+        tier_groups: dict[tuple, list[tuple[int, int, int]]] = {}
+        for src_gpu, dst_gpu, size_bytes in transfers:
+            if src_gpu == dst_gpu:
+                continue
+            tier_key, src_id, dst_id = self._classify_tier(src_gpu, dst_gpu)
+            tier_groups.setdefault(tier_key, []).append((src_id, dst_id, size_bytes))
+        return tier_groups
+
+    def _prepare_group_for_topology(
+        self,
+        tier_name: str,
+        group: list[tuple[int, int, int]],
+    ) -> tuple[list[tuple[int, int, int]], int, dict[int, int]]:
+        """Prepare group for topology simulation using raw IDs.
+        """
+        max_local_id = max(max(src_id, dst_id) for src_id, dst_id, _ in group)
+        participant_to_local = {
+            participant_id: participant_id
+            for src_id, dst_id, _ in group
+            for participant_id in (src_id, dst_id)
+        }
+        return group, max_local_id + 1, participant_to_local
+
+    def _build_worker_pp_transfer_plan(
         self,
         src_pp_stages: list[list[int]],
         dst_pp_stages: list[list[int]],
@@ -690,6 +702,67 @@ class AstraSimManager:
 
         return transfers
 
+    def _build_worker_dp_transfer_plan(
+        self,
+        src_attn_dp_pp_stages: list[list[list[int]]],
+        dst_attn_dp_pp_stages: list[list[list[int]]],
+        kv_cache_size: int,
+        *,
+        p_worker: int,
+        d_worker: int,
+    ) -> list[dict]:
+        """Build a DP+PP+TP-aware KV transfer plan for one worker pair.
+
+        ``kv_cache_size`` is interpreted as the full logical KV payload
+        for the worker pair, before any DP/PP/TP sharding.  The payload
+        is first partitioned across source/destination attention-DP
+        replica pairs using ``lcm(src_dp, dst_dp)`` units, then each
+        replica-pair payload is further split by PP stage and TP rank
+        via ``_build_worker_pp_transfer_plan``.
+        """
+        if kv_cache_size <= 0:
+            return []
+
+        src_dp = len(src_attn_dp_pp_stages)
+        dst_dp = len(dst_attn_dp_pp_stages)
+        if src_dp == 0 or dst_dp == 0:
+            return []
+
+        dp_unit_count = math.lcm(src_dp, dst_dp)
+        src_dp_units = dp_unit_count // src_dp
+        dst_dp_units = dp_unit_count // dst_dp
+
+        kv_per_dp_unit_base = kv_cache_size // dp_unit_count
+        kv_per_dp_unit_rem = kv_cache_size % dp_unit_count
+
+        dp_pair_bytes: dict[tuple[int, int], int] = {}
+        
+        # Balanced Partioning of KV across src DP replicas and dst DP replicas
+        for dp_unit in range(dp_unit_count):
+            unit_bytes = kv_per_dp_unit_base + (1 if dp_unit < kv_per_dp_unit_rem else 0)
+            if unit_bytes == 0:
+                continue
+            src_dp_rank = dp_unit // src_dp_units
+            dst_dp_rank = dp_unit // dst_dp_units
+            key = (src_dp_rank, dst_dp_rank)
+            dp_pair_bytes[key] = dp_pair_bytes.get(key, 0) + unit_bytes
+        transfers: list[dict] = []
+
+        for (src_dp_rank, dst_dp_rank), dp_kv_bytes in sorted(dp_pair_bytes.items()):
+            pair_transfers = self._build_worker_pp_transfer_plan(
+                src_attn_dp_pp_stages[src_dp_rank],
+                dst_attn_dp_pp_stages[dst_dp_rank],
+                dp_kv_bytes,
+                p_worker=p_worker,
+                d_worker=d_worker,
+            )
+            for transfer in pair_transfers:
+                transfer["src_dp_rank"] = src_dp_rank
+                transfer["dst_dp_rank"] = dst_dp_rank
+            transfers.extend(pair_transfers)
+
+        return transfers
+
     def build_kv_transfer_plan(
         self,
         gpu_layout: dict,
@@ -710,10 +783,12 @@ class AstraSimManager:
           workers.  The prefill's ``kv_cache_size`` is divided evenly
           among its targets (each decode gets a subset of sequences).
 
-        PP-stage-level and TP-rank-level splitting are handled by
-        ``_build_worker_transfer_plan``: the full ``pp_stages`` and
-        the per-target ``kv_cache_size`` are passed in, and the method
-        partitions bytes across all PP stage pairs and TP rank pairs.
+        When worker layouts expose ``attn_dp_pp_stages``, KV bytes are
+        first partitioned across attention-DP replicas and then across
+        PP stages / TP ranks.  This supports both AFD workers
+        (attention and FFN GPUs are physically separate) and shared-GPU
+        MoE workers where ``attention_dp`` and ``moe_ep`` coexist on
+        the same GPU pool.
 
         Returns one dict per concrete GPU-to-GPU transfer with
         source/destination GPU IDs, byte count, worker assignment, and
@@ -740,63 +815,26 @@ class AstraSimManager:
             kv_per_target_rem = kv_cache_size % num_targets
 
             for target_idx, d_idx in enumerate(d_indices):
+                # Evenly ditribute the remainder kv_caches among the first few targets
                 target_kv = kv_per_target_base + (
                     1 if target_idx < kv_per_target_rem else 0
                 )
                 prefill_worker = prefill_worker_layouts[p_idx]
                 decode_worker = decode_worker_layouts[d_idx]
-
-                # ── AFD DP-replica-aware path ────────────────────────
-                #
-                # When AFD is enabled, only attention GPUs participate
-                # in KV cache transfer.  Each DP replica holds KV for
-                # ``batch_size / dp_size`` sequences, so KV bytes are
-                # divided by dp_size.  We iterate over DP replicas
-                # independently, using ``attn_dp_pp_stages[dp_rank]``
-                # as the PP stages for each replica.
-                p_afd = prefill_worker.get("enable_afd", False)
-                d_afd = decode_worker.get("enable_afd", False)
-                p_dp = prefill_worker.get("attn_dp_size", 1)
-                d_dp = decode_worker.get("attn_dp_size", 1)
-
-                if p_afd and d_afd and p_dp > 1 and d_dp > 1:
-                    # Both workers are AFD-enabled with DP replicas.
-                    # DP sizes must match for a valid pairing.
-                    dp_size = min(p_dp, d_dp)
-                    kv_per_dp_base = target_kv // dp_size
-                    kv_per_dp_rem = target_kv % dp_size
-
-                    p_dp_stages = prefill_worker["attn_dp_pp_stages"]
-                    d_dp_stages = decode_worker["attn_dp_pp_stages"]
-
-                    for dp_rank in range(dp_size):
-                        kv_per_dp_replica = kv_per_dp_base + (
-                            1 if dp_rank < kv_per_dp_rem else 0
-                        )
-                        pair_transfers = self._build_worker_transfer_plan(
-                            p_dp_stages[dp_rank],
-                            d_dp_stages[dp_rank],
-                            kv_per_dp_replica,
-                            p_worker=p_idx,
-                            d_worker=d_idx,
-                        )
-                        # Tag each transfer with the DP rank for
-                        # traceability.
-                        for t in pair_transfers:
-                            t["dp_rank"] = dp_rank
-                        transfers.extend(pair_transfers)
-                else:
-                    # Non-AFD or dp=1 — use pp_stages directly.
-                    # For AFD with dp=1, pp_stages is already set to
-                    # attn_dp_pp_stages[0] so this works correctly.
-                    pair_transfers = self._build_worker_transfer_plan(
-                        prefill_worker["pp_stages"],
-                        decode_worker["pp_stages"],
-                        target_kv,
-                        p_worker=p_idx,
-                        d_worker=d_idx,
-                    )
-                    transfers.extend(pair_transfers)
+                p_dp_stages = prefill_worker.get("attn_dp_pp_stages") or [
+                    prefill_worker["pp_stages"]
+                ]
+                d_dp_stages = decode_worker.get("attn_dp_pp_stages") or [
+                    decode_worker["pp_stages"]
+                ]
+                pair_transfers = self._build_worker_dp_transfer_plan(
+                    p_dp_stages,
+                    d_dp_stages,
+                    target_kv,
+                    p_worker=p_idx,
+                    d_worker=d_idx,
+                )
+                transfers.extend(pair_transfers)
 
         return transfers
 
@@ -843,7 +881,7 @@ class AstraSimManager:
                     f"GPU {src_gpu} → GPU {dst_gpu} → {latency_ms:.4f} ms"
                 )
                 return latency_ms
-
+        
             # ── Legacy single-topology path ──────────────────────────
             event_queue, topology, _ = self._build_topology(num_total_gpus)
 

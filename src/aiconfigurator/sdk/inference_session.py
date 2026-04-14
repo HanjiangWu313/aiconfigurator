@@ -411,16 +411,24 @@ class DisaggInferenceSession:
             Returns:
                 int: KV cache size in bytes
         """
-        transfer_size = self._prefill_backend.get_total_kv_cache_transfer_size_bytes(
+        per_attn_replica_transfer_size = self._prefill_backend.get_total_kv_cache_transfer_size_bytes(
             model=prefill_model,
             batch_size=prefill_batch_size,
             isl=runtime_config.isl,
             beam_width=1,
             osl=0,
         )
+        attention_dp_size = max(
+            int(getattr(prefill_model.config, "attention_dp_size", 1) or 1),
+            1,
+        )
+        transfer_size = per_attn_replica_transfer_size * attention_dp_size
 
         logger.debug(
-            "KV cache transfer size from backend transfer helper: %sB (batch_size=%s, isl=%s)",
+            "KV cache transfer size: %sB per attention replica × dp=%s = %sB total "
+            "(batch_size=%s, isl=%s)",
+            per_attn_replica_transfer_size,
+            attention_dp_size,
             transfer_size,
             prefill_batch_size,
             runtime_config.isl,
@@ -463,9 +471,11 @@ class DisaggInferenceSession:
             """Build a single worker's GPU layout.
 
             Non-AFD (default):
-                Each PP stage has ``tp_size`` GPUs.  ``pp_stages`` is a
-                list of ``pp_size`` lists, each containing ``tp_size``
-                GPU IDs.  Total GPUs = ``tp_size * pp_size``.
+                GPUs are shared between attention and FFN/MoE work.
+                Each PP stage has ``attn_tp_size * attn_dp_size`` GPUs.
+                ``pp_stages`` is a list of ``pp_size`` lists, each
+                containing all stage GPUs.  The per-attention-DP
+                grouping is stored in ``attn_dp_pp_stages[dp_rank]``.
 
             AFD mode (``enable_afd=True``):
                 Attention and FFN GPUs are **physically separate groups**.
@@ -484,7 +494,7 @@ class DisaggInferenceSession:
 
                 ``pp_stages`` is set to the **attention DP-replica-0**
                 GPU IDs only (``tp_size`` GPUs per stage) so that the
-                existing ``_build_worker_transfer_plan()`` in AstraSim
+                existing ``_build_worker_pp_transfer_plan()`` in AstraSim
                 works unchanged for the DP-replica-0 transfer path.
 
                 The full per-DP-replica attention layout is stored in
@@ -492,12 +502,25 @@ class DisaggInferenceSession:
                 lists, each containing ``attn_tp_size`` GPU IDs.
             """
             if not enable_afd:
-                # Order is tp first and then pp -> [stage0: tp0,tp1,...], [stage1: tp0,tp1,...], ....
+                effective_attn_tp = attn_tp_size or tp_size
+                effective_attn_dp = max(attn_dp_size, 1)
+                gpus_per_stage = effective_attn_tp * effective_attn_dp
+
                 pp_stages = []
                 flat_gpu_ids = []
+                attn_dp_pp_stages: list[list[list[int]]] = [
+                    [] for _ in range(effective_attn_dp)
+                ]
                 for pp_rank in range(pp_size):
-                    stage_start = start_gpu + pp_rank * tp_size
-                    stage_gpu_ids = list(range(stage_start, stage_start + tp_size))
+                    stage_start = start_gpu + pp_rank * gpus_per_stage
+                    stage_gpu_ids = []
+                    for dp_rank in range(effective_attn_dp):
+                        replica_start = stage_start + dp_rank * effective_attn_tp
+                        replica_gpus = list(
+                            range(replica_start, replica_start + effective_attn_tp)
+                        )
+                        attn_dp_pp_stages[dp_rank].append(replica_gpus)
+                        stage_gpu_ids.extend(replica_gpus)
                     pp_stages.append(stage_gpu_ids)
                     flat_gpu_ids.extend(stage_gpu_ids)
                 return {
@@ -506,17 +529,17 @@ class DisaggInferenceSession:
                     "pp_stages": pp_stages,
                     "first_stage_gpus": pp_stages[0] if pp_stages else [],
                     "last_stage_gpus": pp_stages[-1] if pp_stages else [],
-                    "tp_size": tp_size,
+                    "tp_size": effective_attn_tp,
                     "pp_size": pp_size,
                     "enable_afd": False,
-                    "attn_dp_pp_stages": None,
+                    "attn_dp_pp_stages": attn_dp_pp_stages,
                     "ffn_pp_stages": None,
                     "attn_gpu_ids": None,
                     "ffn_gpu_ids": None,
-                    "attn_tp_size": tp_size,
-                    "attn_dp_size": 1,
-                    "ffn_tp_size": 0,
-                    "ffn_ep_size": 0,
+                    "attn_tp_size": effective_attn_tp,
+                    "attn_dp_size": effective_attn_dp,
+                    "ffn_tp_size": ffn_tp_size,
+                    "ffn_ep_size": ffn_ep_size,
                 }
 
             # ── AFD path ─────────────────────────────────────────────
@@ -567,7 +590,7 @@ class DisaggInferenceSession:
                 all_gpu_ids.extend(ffn_stage_gpus)
 
             # pp_stages for KV transfer = DP-replica-0 attention layout.
-            # This makes the existing _build_worker_transfer_plan() work
+            # This makes the existing _build_worker_pp_transfer_plan() work
             # unchanged for the common dp=1 case.  When dp>1, the caller
             # (build_kv_transfer_plan) iterates attn_dp_pp_stages.
             pp_stages = attn_dp_pp_stages[0]
@@ -601,34 +624,38 @@ class DisaggInferenceSession:
         prefill_tp = prefill_model_config.tp_size
         prefill_pp = prefill_model_config.pp_size
         prefill_afd = prefill_model_config.enable_afd
+        p_attn_tp = prefill_tp
+        p_attn_dp = max(prefill_model_config.attention_dp_size, 1)
         if prefill_afd:
-            p_attn_tp = prefill_model_config.tp_size
-            p_attn_dp = prefill_model_config.attention_dp_size
             p_ffn_tp = prefill_model_config.moe_tp_size or prefill_tp
             p_ffn_ep = prefill_model_config.moe_ep_size or 1
             prefill_gpus_per_worker = (p_attn_tp * p_attn_dp + p_ffn_tp * p_ffn_ep) * prefill_pp
         else:
-            p_attn_tp = prefill_tp
-            p_attn_dp = 1
-            p_ffn_tp = 0
-            p_ffn_ep = 0
-            prefill_gpus_per_worker = prefill_tp * prefill_pp
+            if prefill_model_config.moe_tp_size is not None or prefill_model_config.moe_ep_size is not None:
+                p_ffn_tp = prefill_model_config.moe_tp_size or prefill_tp
+                p_ffn_ep = prefill_model_config.moe_ep_size or 1
+            else:
+                p_ffn_tp = 0
+                p_ffn_ep = 0
+            prefill_gpus_per_worker = p_attn_tp * p_attn_dp * prefill_pp
 
         decode_tp = decode_model_config.tp_size
         decode_pp = decode_model_config.pp_size
         decode_afd = decode_model_config.enable_afd
+        d_attn_tp = decode_tp
+        d_attn_dp = max(decode_model_config.attention_dp_size, 1)
         if decode_afd:
-            d_attn_tp = decode_model_config.tp_size
-            d_attn_dp = decode_model_config.attention_dp_size
             d_ffn_tp = decode_model_config.moe_tp_size or decode_tp
             d_ffn_ep = decode_model_config.moe_ep_size or 1
             decode_gpus_per_worker = (d_attn_tp * d_attn_dp + d_ffn_tp * d_ffn_ep) * decode_pp
         else:
-            d_attn_tp = decode_tp
-            d_attn_dp = 1
-            d_ffn_tp = 0
-            d_ffn_ep = 0
-            decode_gpus_per_worker = decode_tp * decode_pp
+            if decode_model_config.moe_tp_size is not None or decode_model_config.moe_ep_size is not None:
+                d_ffn_tp = decode_model_config.moe_tp_size or decode_tp
+                d_ffn_ep = decode_model_config.moe_ep_size or 1
+            else:
+                d_ffn_tp = 0
+                d_ffn_ep = 0
+            decode_gpus_per_worker = d_attn_tp * d_attn_dp * decode_pp
 
         prefill_worker_layouts = []
         decode_worker_layouts = []
