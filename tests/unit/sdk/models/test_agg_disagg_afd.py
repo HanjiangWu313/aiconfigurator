@@ -181,6 +181,86 @@ class TestAggBreakdown:
             print(f"  {key:<34s}  {_fmt(si)}  {_fmt(sol)}  {_fmt(emp)}  {ratio_sol}  {ratio_emp}")
 
 
+class TestAggAFDFFNLoadSignals:
+    """Check that uneven AFD splits surface the expected FFN load signals in agg mode."""
+
+    _AFD_CONFIGS = [
+        (
+            "4A:4F",
+            ModelConfig(
+                tp_size=1,
+                pp_size=1,
+                moe_tp_size=1,
+                moe_ep_size=4,
+                attention_dp_size=4,
+                enable_afd=True,
+            ),
+        ),
+        (
+            "6A:2F",
+            ModelConfig(
+                tp_size=1,
+                pp_size=1,
+                moe_tp_size=1,
+                moe_ep_size=2,
+                attention_dp_size=6,
+                enable_afd=True,
+            ),
+        ),
+    ]
+
+    @staticmethod
+    def _run_agg(perf_db, runtime_cfg, model_config):
+        backend = _BACKEND_INSTANCE
+        backend._agg_cache.clear()
+        model = get_model(_MODEL_PATH, model_config, backend.name.value)
+        session = InferenceSession(model=model, database=perf_db, backend=backend)
+        return session.run_agg(runtime_cfg, ctx_tokens=_CTX_TOKENS)
+
+    def test_uneven_attn_ffn_split_increases_ffn_input_tokens(self, perf_db, runtime_cfg):
+        results = {
+            label: self._run_agg(perf_db, runtime_cfg, cfg).get_result_dict()
+            for label, cfg in self._AFD_CONFIGS
+        }
+
+        even = results["4A:4F"]
+        skewed = results["6A:2F"]
+
+        print(f"\n{'=' * 110}")
+        print("  AGG AFD FFN LOAD SIGNALS")
+        print(f"  {'metric':<34s}  {'4A:4F':>14s}  {'6A:2F':>14s}  {'ratio':>10s}")
+        print(f"  {'-' * 104}")
+        for key in [
+            "global_bs",
+            "num_attn_gpus",
+            "num_ffn_gpus",
+            "ffn_mix_input_tokens",
+            "ffn_mix_input_tokens_per_gpu",
+            "ffn_gen_input_tokens",
+            "ffn_gen_input_tokens_per_gpu",
+            "tokens/s",
+            "request_rate",
+        ]:
+            even_v = even[key]
+            skewed_v = skewed[key]
+            ratio = f"{skewed_v / even_v:10.2f}x" if even_v else f"{'inf':>10s}"
+            if isinstance(even_v, (int, float)) and isinstance(skewed_v, (int, float)):
+                print(f"  {key:<34s}  {even_v:14.4f}  {skewed_v:14.4f}  {ratio}")
+            else:
+                print(f"  {key:<34s}  {str(even_v):>14s}  {str(skewed_v):>14s}  {'-':>10s}")
+
+        assert even["num_attn_gpus"] == 4
+        assert even["num_ffn_gpus"] == 4
+        assert skewed["num_attn_gpus"] == 6
+        assert skewed["num_ffn_gpus"] == 2
+
+        assert skewed["global_bs"] > even["global_bs"]
+        assert skewed["ffn_mix_input_tokens"] > even["ffn_mix_input_tokens"]
+        assert skewed["ffn_mix_input_tokens_per_gpu"] > even["ffn_mix_input_tokens_per_gpu"]
+        assert skewed["ffn_gen_input_tokens"] > even["ffn_gen_input_tokens"]
+        assert skewed["ffn_gen_input_tokens_per_gpu"] > even["ffn_gen_input_tokens_per_gpu"]
+
+
 class TestDisaggBreakdown:
     """Print a side-by-side SILICON / SOL / EMPIRICAL comparison of run_disagg metrics."""
 

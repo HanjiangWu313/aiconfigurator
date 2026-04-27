@@ -93,6 +93,30 @@ if (BUILDTARGET STREQUAL "all" OR BUILDTARGET STREQUAL "congestion_unaware")
     target_include_directories(Analytical_Congestion_Unaware PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include/)
     target_include_directories(Analytical_Congestion_Unaware PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include/astra-network-analytical/)
     target_include_directories(Analytical_Congestion_Unaware PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/extern/)
+
+    set_target_properties(Analytical_Congestion_Unaware PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+    # Create Python bindings for Congestion-unaware Backend
+    pybind11_add_module(simulation_py_congestion_unaware
+        ${CMAKE_CURRENT_SOURCE_DIR}/congestion_unaware/simulation_pybindings.cpp
+    )
+
+    target_link_libraries(simulation_py_congestion_unaware
+        PRIVATE
+            Analytical_Congestion_Unaware
+            yaml-cpp
+    )
+
+    target_include_directories(simulation_py_congestion_unaware
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include/
+            ${CMAKE_CURRENT_SOURCE_DIR}/include/astra-network-analytical/
+            ${CMAKE_CURRENT_SOURCE_DIR}/extern/
+    )
+
+    set_target_properties(simulation_py_congestion_unaware PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/../lib/
+    )
 endif ()
 
 # Compile Congestion Aware Backend

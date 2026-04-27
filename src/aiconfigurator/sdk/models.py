@@ -277,7 +277,7 @@ class BaseModel:
     # (e.g., DeepSeek MLA has extra bmm ops, NemotronH has mamba layers).
     _ATTN_COMPONENTS = {
         "embedding", "add_norm_1", "qkv_gemm", "attention", "proj_gemm",
-        "ar_1", "p2p",
+        "ar_1", "p2p", "router_gemm",
     }
 
     # 4-stage AFD pipeline classification.
@@ -1086,6 +1086,7 @@ class DeepSeekModel(BaseModel):
             else self.config.workload_distribution
         )
 
+        enable_afd = self.config.enable_afd
         self.context_ops.extend(
             [
                 ops.Embedding("context_embedding", 1, self._vocab_size, h, 0.3),
@@ -1179,6 +1180,7 @@ class DeepSeekModel(BaseModel):
                     moe_ep_size,
                     attention_dp_size,
                     True,
+                    enable_afd=enable_afd,
                 )
             ]
         )
@@ -1215,6 +1217,7 @@ class DeepSeekModel(BaseModel):
                     moe_ep_size,
                     attention_dp_size,
                     False,
+                    enable_afd=enable_afd,
                 )
             ]
         )
@@ -1352,6 +1355,7 @@ class DeepSeekModel(BaseModel):
                     moe_ep_size,
                     attention_dp_size,
                     True,
+                    enable_afd=enable_afd,
                 )
             ]
         )
@@ -1388,6 +1392,7 @@ class DeepSeekModel(BaseModel):
                     moe_ep_size,
                     attention_dp_size,
                     False,
+                    enable_afd=enable_afd,
                 )
             ]
         )
@@ -1470,6 +1475,8 @@ class WideEPDeepSeekModel(BaseModel):
         )
 
         sms = self.config.sms
+
+        enable_afd = self.config.enable_afd
 
         # context mla attention
         self.context_ops.extend(
@@ -1561,6 +1568,7 @@ class WideEPDeepSeekModel(BaseModel):
                     moe_backend=moe_backend,
                     is_context=True,
                     scale_num_tokens=tp_size,
+                    enable_afd=enable_afd,
                 )
             ]
         )
@@ -1643,6 +1651,7 @@ class WideEPDeepSeekModel(BaseModel):
                     sms=sms,
                     moe_backend=moe_backend,
                     is_context=False,
+                    enable_afd=enable_afd,
                 )
             ]
         )
@@ -1664,6 +1673,7 @@ class WideEPDeepSeekModel(BaseModel):
                     attention_dp_size,
                     is_context=False,
                     moe_backend=moe_backend,
+                    enable_afd=enable_afd,
                 )
             ]
         )
@@ -1990,7 +2000,6 @@ class NemotronHModel(BaseModel):
         self._moe_inter_size = moe_inter_size
         self._hybrid_config: common.NemotronHConfig | None = None
         self._power_law_alpha = 1.01  # follow DeepSeek MoE
-
     def set_hybrid_config(self, hybrid_config: common.NemotronHConfig) -> None:
         """
         Set the hybrid layer configuration and build operation pipelines.
@@ -2039,9 +2048,8 @@ class NemotronHModel(BaseModel):
 
         # Use base model parameters for standard fields
         num_kv_heads_per_gpu = (self._num_kv_heads + tp_size - 1) // tp_size
-
+        enable_afd = self.config.enable_afd
         self.context_ops = []
-
         # Embedding
         self.context_ops.append(ops.Embedding("context_embedding", 1, self._vocab_size, h, 0.3))
 
@@ -2161,6 +2169,7 @@ class NemotronHModel(BaseModel):
                         moe_ep_size,
                         attention_dp_size,
                         True,
+                        enable_afd=enable_afd,
                     ),
                     ops.MoE(
                         "context_moe",
@@ -2186,6 +2195,7 @@ class NemotronHModel(BaseModel):
                         moe_ep_size,
                         attention_dp_size,
                         False,
+                        enable_afd=enable_afd,
                     ),
                     # TRT-LLM does allreduce after combining routed + shared outputs when TP>1
                     ops.CustomAllReduce("context_moe_ar", count, h, tp_size),
@@ -2267,7 +2277,7 @@ class NemotronHModel(BaseModel):
         num_kv_heads_per_gpu = (self._num_kv_heads + tp_size - 1) // tp_size
 
         self.generation_ops = []
-
+        enable_afd = self.config.enable_afd
         # Embedding
         self.generation_ops.append(ops.Embedding("generation_embedding", 1, self._vocab_size, h, 0.3))
 
@@ -2386,6 +2396,7 @@ class NemotronHModel(BaseModel):
                         moe_ep_size,
                         attention_dp_size,
                         True,
+                        enable_afd=enable_afd,
                     ),
                     ops.MoE(
                         "generation_moe",
@@ -2411,6 +2422,7 @@ class NemotronHModel(BaseModel):
                         moe_ep_size,
                         attention_dp_size,
                         False,
+                        enable_afd=enable_afd,
                     ),
                     # TRT-LLM does allreduce after combining routed + shared outputs when TP>1
                     ops.CustomAllReduce("generation_moe_ar", count, h, tp_size),

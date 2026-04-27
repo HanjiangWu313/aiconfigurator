@@ -308,8 +308,11 @@ class MoEDispatch(Operation):
             N_ffn = int(ffn_gpus)
             total_gpus = M_attn + N_ffn
 
-            # Global activation volume (elements) — local volume scaled up
-            E_total = float(volume * M_attn)
+            # Global activation volume (elements) across attention data-parallel replicas.
+            # ``volume`` is batch_tokens * full hidden size for one DP replica. Tensor
+            # parallel ranks shard that hidden dimension, so only DP replicas contribute
+            attention_dp_size = max(1, int(self._attention_dp_size))
+            E_total = float(volume * attention_dp_size)
 
             if self._pre_dispatch:
                 # ---- Pre-dispatch: Attn → FFN (dispatch with routing fanout) ----
@@ -319,7 +322,8 @@ class MoEDispatch(Operation):
                 k_worst = max(1, min(int(self._topk), N_ffn))
                 k_avg = (1.0 + float(k_worst)) / 2.0
 
-                # Per attn GPU outgoing bytes (including routing duplication)
+                # Per attn GPU outgoing bytes, including routing duplication
+                # In default, it factors in the TP on the attention, so divided by (dp * tp)
                 sender_bytes = int((E_total / M_attn) * k_avg * dtype.value.memory)
                 # Per FFN GPU incoming bytes (balanced receive assumption)
                 receiver_bytes = int((E_total * k_avg / N_ffn) * dtype.value.memory)
@@ -334,6 +338,9 @@ class MoEDispatch(Operation):
                 sender_bytes=sender_bytes,
                 receiver_bytes=receiver_bytes,
                 num_gpus=total_gpus,
+                num_attn_gpus=M_attn,
+                num_ffn_gpus=N_ffn,
+                pre_dispatch=self._pre_dispatch,
             )
             return PerformanceResult(float(comm_latency) * self._scale_factor, energy=0.0)
 

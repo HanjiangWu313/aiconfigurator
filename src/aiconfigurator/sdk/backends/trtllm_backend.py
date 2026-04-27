@@ -297,6 +297,15 @@ class TRTLLMBackend(BaseBackend):
             moe = model.config.moe_quant_mode.name
             comm = model.config.comm_quant_mode.name
             mem = memory["total"]
+            ffn_group_gpus = model.config.num_ffn_gpus or max((moe_tp or 1) * (moe_ep or 1), 1)
+            ffn_mix_input_tokens = (num_mix_ctx_tokens + num_mix_gen_tokens) * dp
+            ffn_gen_input_tokens = num_genonly_tokens * dp
+            ffn_mix_input_tokens_per_gpu = (
+                ffn_mix_input_tokens / ffn_group_gpus if ffn_group_gpus > 0 else 0.0
+            )
+            ffn_gen_input_tokens_per_gpu = (
+                ffn_gen_input_tokens / ffn_group_gpus if ffn_group_gpus > 0 else 0.0
+            )
 
             result_dict = {
                 "model": model.model_path,
@@ -336,6 +345,10 @@ class TRTLLMBackend(BaseBackend):
                 "num_tokens": num_tokens,
                 "ctx_tokens": ctx_tokens,
                 "gen_tokens": num_gen_requests,
+                "ffn_mix_input_tokens": ffn_mix_input_tokens,
+                "ffn_mix_input_tokens_per_gpu": ffn_mix_input_tokens_per_gpu,
+                "ffn_gen_input_tokens": ffn_gen_input_tokens,
+                "ffn_gen_input_tokens_per_gpu": ffn_gen_input_tokens_per_gpu,
                 "backend": database.backend,
                 "version": database.version,
                 "system": database.system,

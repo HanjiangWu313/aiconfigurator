@@ -2384,24 +2384,28 @@ class PerfDatabase:
         message_size_bytes: int,
         num_gpus: int,
         operation: str,
+        gpu_ids: list[int] | None = None,
     ) -> float | None:
         """Simulate a collective communication operation using AstraSim.
 
         Delegates to the :class:`AstraSimManager` which handles topology
-        creation (with on-the-fly YAML generation and caching).
+        creation (with on-the-fly YAML generation and caching).  When a
+        ``system_spec`` is available the collective is automatically
+        routed through the correct network tiers.
 
         Args:
             message_size_bytes: Total message payload in **bytes**.
             num_gpus: Number of GPUs participating in the collective.
             operation: One of ``"all_reduce"``, ``"all_gather"``,
                 ``"reduce_scatter"``, ``"alltoall"``.
+            gpu_ids: Optional explicit GPU IDs for tiered simulation.
 
         Returns:
             Simulated latency in **milliseconds**, or ``None`` on failure.
         """
         if self._astrasim is None:
             raise RuntimeError("_simulate_astrasim_collective called but AstraSim is not enabled")
-        return self._astrasim.simulate_collective(message_size_bytes, num_gpus, operation)
+        return self._astrasim.simulate_collective(message_size_bytes, num_gpus, operation, gpu_ids=gpu_ids)
 
     def _simulate_astrasim_p2p(
         self,
@@ -3021,8 +3025,8 @@ class PerfDatabase:
         if database_mode is None:
             database_mode = self._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
-            sol_latency = get_sol(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)[0]
-            return PerformanceResult(sol_latency, energy=0.0)
+            sol_time, sol_math, sol_mem = get_sol(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)
+            return PerformanceResult(sol_time, energy=0.0)
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
@@ -3391,7 +3395,12 @@ class PerfDatabase:
         if database_mode is None:
             database_mode = self._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
-            sol_time = get_sol(b, s, prefix, tp_size, kvcache_quant_mode, fmha_quant_mode)[0]
+            sol_time, sol_math, sol_mem = get_sol(b, s, prefix, tp_size, kvcache_quant_mode, fmha_quant_mode)
+            logger.debug(
+                f"wideep_context_mla sol: b={b} s={s} prefix={prefix} tp={tp_size}"
+                f"  compute={sol_math:.3f} ms  memory={sol_mem:.3f} ms"
+                f"  bound={'compute' if sol_math >= sol_mem else 'memory'}  sol={sol_time:.3f} ms"
+            )
             return PerformanceResult(sol_time, energy=0.0)
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(b, s, prefix, tp_size, kvcache_quant_mode, fmha_quant_mode)
@@ -4218,17 +4227,23 @@ class PerfDatabase:
         receiver_bytes: int,
         num_gpus: int = 0,
         database_mode: common.DatabaseMode | None = None,
+        num_attn_gpus: int = 0,
+        num_ffn_gpus: int = 0,
+        pre_dispatch: bool = True,
     ) -> PerformanceResult:
         """Query AFD (Attention-FFN Disaggregation) point-to-point communication latency.
 
         Models the M-to-N P2P routing makespan between attention and FFN GPU groups.
-        The latency is ``max(t_send, t_recv) + startup_overhead`` where:
 
-        * ``t_send``: time for the slowest sender GPU to push *sender_bytes* outbound.
-        * ``t_recv``: time for the slowest receiver GPU to pull *receiver_bytes* inbound.
+        When AstraSim is available **and** ``num_attn_gpus`` / ``num_ffn_gpus``
+        are provided, the transfers are decomposed into concrete
+        GPU-to-GPU P2P pairs and routed through the correct network
+        tiers (NVLink / IB) using the same :meth:`_simulate_tiered_transfers`
+        pipeline as KV-cache transfers.
 
-        Bandwidth is selected by the three-tier model in :meth:`_get_p2p_bandwidth`
-        (intra-node / inter-node / inter-rack) based on *num_gpus*.
+        Otherwise the analytical model is used:
+        ``max(t_send, t_recv) + startup_overhead`` with bandwidth
+        selected by the three-tier model in :meth:`_get_p2p_bandwidth`.
 
         Args:
             sender_bytes: Bytes each sender GPU pushes.
@@ -4236,6 +4251,13 @@ class PerfDatabase:
             num_gpus: Total GPUs involved in the communication (for bandwidth
                       tier selection).  If 0, falls back to ``inter_node_bw``.
             database_mode: Optional database-mode override.
+            num_attn_gpus: Number of attention GPUs (for AstraSim tiered
+                simulation).  When 0, falls back to the legacy AstraSim
+                path or analytical model.
+            num_ffn_gpus: Number of FFN GPUs (for AstraSim tiered
+                simulation).
+            pre_dispatch: ``True`` for attn→FFN (dispatch), ``False``
+                for FFN→attn (combine).  Only used by the AstraSim path.
 
         Returns:
             PerformanceResult: Latency in ms.
@@ -4243,13 +4265,18 @@ class PerfDatabase:
         if sender_bytes <= 0 and receiver_bytes <= 0:
             return PerformanceResult(0.0, energy=0.0)
 
-        # ---- AstraSim path ----
-        if self._use_astrasim:
-            # Model as bidirectional P2P: simulate the larger transfer
-            # (makespan is dominated by the bigger direction)
-            max_bytes = max(sender_bytes, receiver_bytes)
-            latency_ms = self._simulate_astrasim_p2p(
-                message_size_bytes=max_bytes, src_gpu=0, dst_gpu=1,
+        # ---- AstraSim tiered path ----
+        if self._use_astrasim and num_attn_gpus > 0 and num_ffn_gpus > 0:
+            # Generate GPU IDs with the standard AFD layout:
+            # attn GPUs [0, M), FFN GPUs [M, M+N)
+            attn_ids = list(range(num_attn_gpus))
+            ffn_ids = list(range(num_attn_gpus, num_attn_gpus + num_ffn_gpus))
+            latency_ms = self._astrasim.simulate_afd_transfers(
+                attn_gpu_ids=attn_ids,
+                ffn_gpu_ids=ffn_ids,
+                sender_bytes_per_gpu=sender_bytes,
+                receiver_bytes_per_gpu=receiver_bytes,
+                pre_dispatch=pre_dispatch,
             )
             if latency_ms is not None:
                 # Add P2P routing setup overhead (10 us = 0.01 ms)

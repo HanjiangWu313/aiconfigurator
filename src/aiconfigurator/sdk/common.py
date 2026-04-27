@@ -323,6 +323,10 @@ ColumnsAgg = [
     "num_tokens",
     "ctx_tokens",
     "gen_tokens",  # agg specific
+    "ffn_mix_input_tokens",
+    "ffn_mix_input_tokens_per_gpu",
+    "ffn_gen_input_tokens",
+    "ffn_gen_input_tokens_per_gpu",
     "backend",
     "version",
     "system",
