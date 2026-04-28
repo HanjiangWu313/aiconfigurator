@@ -1,0 +1,31 @@
+exps:
+  - disagg_4p_2d
+
+disagg_4p_2d:
+  serving_mode: disagg
+  model_path: Qwen/Qwen3-32B
+  system_name: h200_sxm
+  backend_name: trtllm
+  total_gpus: 12
+  isl: 4000
+  osl: 500
+  ttft: 2000
+  tpot: 30
+  
+  config:
+    prefill_worker_config:
+      tp_list: [1]         # Only TP=1
+      pp_list: [1]         # Only PP=1
+      num_gpu_per_worker: [1]  # 1 GPU per prefill worker
+    decode_worker_config:
+      tp_list: [2]         # Only TP=2 (so 2 GPUs per decode worker)
+      pp_list: [1]         # Only PP=1
+      num_gpu_per_worker: [2]  # 2 GPUs per decode worker
+    replica_config:
+      num_gpu_per_replica: [8]  # 4 prefill * 1 GPU + 2 decode * 2 GPUs = 8
+      max_gpu_per_replica: 8
+      max_prefill_worker: 4     # Exactly 4 prefill workers
+      max_decode_worker: 2      # Exactly 2 decode workers
+    advanced_tuning_config:
+      prefill_max_batch_size: 1
+      decode_max_batch_size: 1

@@ -1,10 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from dataclasses import dataclass
-from typing import Union
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Union
 
 from aiconfigurator.sdk import common
+
+if TYPE_CHECKING:
+    from aiconfigurator.sdk.backends.base_backend import BaseBackend
+    from aiconfigurator.sdk.models import BaseModel
+    from aiconfigurator.sdk.perf_database import PerfDatabase
 
 
 @dataclass
@@ -35,6 +42,10 @@ class ModelConfig:
     enable_wideep: bool = False
     enable_eplb: bool = False  # Expert Parallel Load Balancing
     wideep_num_slots: int = None  # EPLB num_slots, defaults to num_experts if None
+    enable_afd: bool = False  # enable AFD (Attention-FFN Disaggregation) inter-machine communication
+    num_attn_gpus: int = None  # AFD: number of GPUs dedicated to attention (decoupled from FFN)
+    num_ffn_gpus: int = None  # AFD: number of GPUs dedicated to FFN/MoE (decoupled from attention)
+    afd_num_microbatches: int = 1  # AFD: number of microbatches for 4-stage pipeline (1 = no overlap, max 4)
 
 
 @dataclass
@@ -54,3 +65,46 @@ class RuntimeConfig:
     seq_imbalance_correction_scale: float = 1.0
     # Separate correction scale for generation/decoding stage (do NOT reuse ctx scale).
     gen_seq_imbalance_correction_scale: float = 1.0
+
+
+@dataclass
+class AfdConfig:
+    """
+    Optional configuration for heterogeneous AFD (Attention-FFN Disaggregation).
+
+    When provided to ``InferenceSession`` or ``DisaggInferenceSession``, allows
+    attention and FFN GPU groups to use **different** performance databases (i.e.
+    different system YAML files / hardware), backends, and model configurations
+    (e.g. different TP sizes or quantization modes).
+
+    This mirrors the prefill / decode split already available in
+    ``DisaggInferenceSession``, but applied *within* a single worker to the
+    attention vs. FFN partition.
+
+    **Fallback behaviour** — any field left as ``None`` inherits the session's
+    default model, database, or backend.
+
+    Typical usage::
+
+        # Attention GPUs on H100-SXM, FFN GPUs on B200-SXM
+        afd = AfdConfig(
+            attn_database=h100_db,
+            ffn_database=b200_db,
+        )
+        sess = InferenceSession(model=model, database=h100_db,
+                                backend=backend, afd_config=afd)
+
+    For full heterogeneity (different TP / quant per group), also set
+    ``attn_model`` and ``ffn_model`` which should be built via
+    ``models.get_model()`` with the appropriate ``ModelConfig``.
+    """
+
+    # --- Attention GPU group ---
+    attn_model: BaseModel | None = None
+    attn_database: PerfDatabase | None = None
+    attn_backend: BaseBackend | None = None
+
+    # --- FFN GPU group ---
+    ffn_model: BaseModel | None = None
+    ffn_database: PerfDatabase | None = None
+    ffn_backend: BaseBackend | None = None

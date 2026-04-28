@@ -1,0 +1,29 @@
+# macOS
+.DS_Store
+
+# CMake
+cmake-build-*/
+CMakeLists.txt.user
+CMakeCache.txt
+CMakeFiles
+CMakeScripts
+Testing
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps
+
+# JetBrains
+.idea/
+
+# build
+build/
+
+# Built libraries and binaries
+lib/
+bin/
+
+# Auto-generated topology configs
+input/auto_generated/
