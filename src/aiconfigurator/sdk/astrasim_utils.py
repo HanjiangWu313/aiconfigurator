@@ -20,7 +20,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Path constants
+# Path constants to the astrasim library
 # ---------------------------------------------------------------------------
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", "..", ".."))
@@ -853,7 +853,11 @@ class AstraSimManager:
 
             if pre_dispatch:
                 N = len(ffn_gpu_ids)
-                bytes_per_link = max(1, sender_bytes_per_gpu // N)
+                bytes_per_link = (
+                    max(1, sender_bytes_per_gpu // N)
+                    if sender_bytes_per_gpu > 0
+                    else 0
+                )
                 self._log_afd_payload_debug(
                     direction="attn->FFN",
                     num_senders=len(attn_gpu_ids),
@@ -863,12 +867,17 @@ class AstraSimManager:
                     bytes_per_link=bytes_per_link,
                     transfer_count=len(attn_gpu_ids) * N,
                 )
-                for attn_gpu in attn_gpu_ids:
-                    for ffn_gpu in ffn_gpu_ids:
-                        record_transfer(attn_gpu, ffn_gpu, bytes_per_link)
+                if bytes_per_link > 0:
+                    for attn_gpu in attn_gpu_ids:
+                        for ffn_gpu in ffn_gpu_ids:
+                            record_transfer(attn_gpu, ffn_gpu, bytes_per_link)
             else:
                 M = len(attn_gpu_ids)
-                bytes_per_link = max(1, sender_bytes_per_gpu // M)
+                bytes_per_link = (
+                    max(1, sender_bytes_per_gpu // M)
+                    if sender_bytes_per_gpu > 0
+                    else 0
+                )
                 self._log_afd_payload_debug(
                     direction="FFN->attn",
                     num_senders=len(ffn_gpu_ids),
@@ -878,9 +887,10 @@ class AstraSimManager:
                     bytes_per_link=bytes_per_link,
                     transfer_count=len(ffn_gpu_ids) * M,
                 )
-                for ffn_gpu in ffn_gpu_ids:
-                    for attn_gpu in attn_gpu_ids:
-                        record_transfer(ffn_gpu, attn_gpu, bytes_per_link)
+                if bytes_per_link > 0:
+                    for ffn_gpu in ffn_gpu_ids:
+                        for attn_gpu in attn_gpu_ids:
+                            record_transfer(ffn_gpu, attn_gpu, bytes_per_link)
 
             max_delay_ns = max(
                 max(sender_elapsed_ns.values(), default=0),

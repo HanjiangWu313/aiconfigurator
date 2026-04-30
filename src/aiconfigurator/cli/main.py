@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import time
 from typing import Any
 
@@ -284,6 +285,7 @@ def _build_default_task_configs(args) -> dict[str, TaskConfig]:
         "request_latency": args.request_latency,
         "prefix": args.prefix,
         "database_mode": args.database_mode,
+        "enable_wideep": getattr(args, "enable_wideep", False),
         "afd_attn_system_name": getattr(args, "afd_attn_system", None),
         "afd_ffn_system_name": getattr(args, "afd_ffn_system", None),
     }
@@ -300,6 +302,52 @@ def _build_default_task_configs(args) -> dict[str, TaskConfig]:
     task_configs["disagg"] = disagg_task
 
     return task_configs
+
+
+def build_default_task_configs(
+    *,
+    model_path: str,
+    total_gpus: int,
+    system: str,
+    decode_system: str | None = None,
+    backend: str = "trtllm",
+    backend_version: str | None = None,
+    database_mode: str = "SILICON",
+    isl: int = 4000,
+    osl: int = 1000,
+    ttft: float = 2000.0,
+    tpot: float = 30.0,
+    request_latency: float | None = None,
+    prefix: int = 0,
+    enable_wideep: bool = False,
+    afd_attn_system: str | None = None,
+    afd_ffn_system: str | None = None,
+    decode_afd_attn_system: str | None = None,
+    decode_afd_ffn_system: str | None = None,
+    **_: Any,
+) -> dict[str, TaskConfig]:
+    """Programmatic wrapper for the default CLI task builder."""
+    args = argparse.Namespace(
+        model_path=model_path,
+        total_gpus=total_gpus,
+        system=system,
+        decode_system=decode_system,
+        backend=backend,
+        backend_version=backend_version,
+        database_mode=database_mode,
+        isl=isl,
+        osl=osl,
+        ttft=ttft,
+        tpot=tpot,
+        request_latency=request_latency,
+        prefix=prefix,
+        enable_wideep=enable_wideep,
+        afd_attn_system=afd_attn_system,
+        afd_ffn_system=afd_ffn_system,
+        decode_afd_attn_system=decode_afd_attn_system,
+        decode_afd_ffn_system=decode_afd_ffn_system,
+    )
+    return _build_default_task_configs(args)
 
 
 _EXPERIMENT_RESERVED_KEYS = {
@@ -466,10 +514,41 @@ def _build_experiment_task_configs(args) -> dict[str, TaskConfig]:
     return task_configs
 
 
+def build_experiment_task_configs(
+    *,
+    yaml_path: str | None = None,
+    config: dict[str, dict] | None = None,
+) -> dict[str, TaskConfig]:
+    """Programmatic wrapper for experiment task configs."""
+    if (yaml_path is None) == (config is None):
+        raise ValueError("Provide exactly one of yaml_path or config.")
+    if yaml_path is not None:
+        return _build_experiment_task_configs(argparse.Namespace(yaml_path=yaml_path))
+
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False, encoding="utf-8") as fh:
+        yaml.safe_dump(config, fh)
+        tmp_path = fh.name
+    try:
+        return _build_experiment_task_configs(argparse.Namespace(yaml_path=tmp_path))
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            logger.debug("Failed to remove temporary experiment YAML %s", tmp_path)
+
+
 def _execute_task_configs(
     task_configs: dict[str, TaskConfig],
     mode: str,
-) -> tuple[str, dict[str, pd.DataFrame], dict[str, pd.DataFrame], dict[str, float]]:
+    top_n: int = 5,
+    strict_sla: bool = False,
+) -> tuple[
+    str,
+    dict[str, pd.DataFrame],
+    dict[str, pd.DataFrame],
+    dict[str, float],
+    dict[str, dict[str, float]],
+]:
     """Execute the task configs and return the chosen experiment, best configs, results, and best
     throughputs."""
     results: dict[str, dict[str, pd.DataFrame]] = {}
@@ -509,6 +588,7 @@ def _execute_task_configs(
 
     best_configs: dict[str, pd.DataFrame] = {}
     best_throughputs: dict[str, float] = {}
+    best_latencies: dict[str, dict[str, float]] = {}
     pareto_fronts: dict[str, pd.DataFrame | None] = {}
     pareto_x_axis: dict[str, str] = {}
     for name, task_result in results.items():
@@ -521,6 +601,13 @@ def _execute_task_configs(
 
         # Compute tokens/s/gpu_cluster for pareto_df
         if pareto_df is not None and not pareto_df.empty:
+            pareto_df = pareto_df.copy()
+            if strict_sla:
+                if use_request_latency and "request_latency" in pareto_df.columns:
+                    pareto_df = pareto_df[pareto_df["request_latency"] <= target_request_latency]
+                elif "ttft" in pareto_df.columns and "tpot" in pareto_df.columns:
+                    pareto_df = pareto_df[(pareto_df["ttft"] <= runtime_cfg.ttft) & (pareto_df["tpot"] <= target_tpot)]
+
             pareto_df["tokens/s/gpu_cluster"] = (
                 pareto_df["tokens/s/gpu"]
                 * (total_gpus // pareto_df["num_total_gpus"])
@@ -545,7 +632,7 @@ def _execute_task_configs(
                 total_gpus=total_gpus,
                 pareto_df=pareto_df,
                 target_request_latency=target_request_latency,
-                top_n=5,
+                top_n=top_n,
                 group_by=group_by_key,
             )
         else:
@@ -553,7 +640,7 @@ def _execute_task_configs(
                 total_gpus=total_gpus,
                 pareto_df=pareto_df,
                 target_tpot=target_tpot,
-                top_n=5,
+                top_n=top_n,
                 group_by=group_by_key,
             )
         best_configs[name] = best_config_df
@@ -561,8 +648,15 @@ def _execute_task_configs(
         pareto_x_axis[name] = x_axis_col
         if not best_config_df.empty:
             best_throughputs[name] = best_config_df["tokens/s/gpu_cluster"].values[0]
+            row = best_config_df.iloc[0]
+            best_latencies[name] = {
+                key: float(row[key])
+                for key in ("ttft", "tpot", "request_latency")
+                if key in row and pd.notna(row[key])
+            }
         else:
             best_throughputs[name] = 0.0
+            best_latencies[name] = {}
 
     chosen_exp = max(best_throughputs, key=best_throughputs.get) if best_throughputs else "none"
 
@@ -579,7 +673,7 @@ def _execute_task_configs(
     end_time = time.time()
     logger.info("All experiments completed in %.2f seconds", end_time - start_time)
 
-    return chosen_exp, best_configs, pareto_fronts, best_throughputs
+    return chosen_exp, best_configs, pareto_fronts, best_throughputs, best_latencies
 
 
 def _run_generate_mode(args):
@@ -660,7 +754,7 @@ def main(args):
     else:
         raise SystemExit(f"Unsupported mode: {args.mode}")
 
-    chosen_exp, best_configs, pareto_fronts, best_throughputs = _execute_task_configs(
+    chosen_exp, best_configs, pareto_fronts, best_throughputs, _ = _execute_task_configs(
         task_configs,
         args.mode,
     )

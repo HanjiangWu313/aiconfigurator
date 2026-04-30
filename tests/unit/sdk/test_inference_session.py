@@ -98,7 +98,7 @@ def _build_mock_backend():
     backend = MagicMock()
     backend.name = SimpleNamespace(value="sglang")
 
-    def _run_static(model, database, runtime_config, mode, stride=32, latency_correction_scale=1.0):
+    def _run_static(model, database, runtime_config, mode, stride=32, latency_correction_scale=1.0, **kwargs):
         tp = model._tp
         pp = model._pp
         dp = model._dp

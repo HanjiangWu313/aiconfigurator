@@ -15,7 +15,6 @@ from aiconfigurator.sdk import common
 from aiconfigurator.sdk.config import RuntimeConfig
 from aiconfigurator.sdk.inference_summary import InferenceSummary
 from aiconfigurator.sdk.models import BaseModel
-from aiconfigurator.sdk.operations import MoEDispatch
 from aiconfigurator.sdk.perf_database import PerfDatabase
 
 if TYPE_CHECKING:
@@ -40,6 +39,154 @@ class BaseBackend(ABC):
             It should be implemented in the subclass.
         _get_memory_usage: this is backend-specific. It should be implemented in the subclass.
     """
+
+    def _run_context_phase(
+        self,
+        model: BaseModel,
+        database: PerfDatabase,
+        runtime_config: RuntimeConfig,
+        batch_size: int,
+        isl: int,
+        prefix: int,
+    ) -> tuple[dict[str, float], dict[str, float]]:
+        context_latency_dict = defaultdict(float)
+        context_energy_wms_dict = defaultdict(float)
+
+        effective_isl = isl - prefix
+        if effective_isl <= 0:
+            raise ValueError(f"isl must be greater than 0 after removing prefix, but got {effective_isl}")
+
+        for op in model.context_ops:
+            x = batch_size * effective_isl if "logits_gemm" not in op._name else batch_size
+            result = op.query(
+                database,
+                x=x,
+                batch_size=batch_size,
+                beam_width=1,
+                s=effective_isl,
+                prefix=prefix,
+                model_name=getattr(model, "model_name", ""),
+                seq_imbalance_correction_scale=runtime_config.seq_imbalance_correction_scale,
+            )
+            context_latency_dict[op._name] += float(result)
+            context_energy_wms_dict[op._name] += getattr(result, "energy", 0.0)
+
+        return context_latency_dict, context_energy_wms_dict
+
+    def _run_generation_phase(
+        self,
+        model: BaseModel,
+        database: PerfDatabase,
+        runtime_config: RuntimeConfig,
+        batch_size: int,
+        beam_width: int,
+        isl: int,
+        osl: int,
+        stride: int,
+    ) -> tuple[dict[str, float], dict[str, float]]:
+        generation_latency_dict = defaultdict(float)
+        generation_energy_wms_dict = defaultdict(float)
+
+        batch_size = batch_size * (model._nextn + 1)
+
+        for i in range(0, osl - 1, stride):
+            latency_dict = defaultdict(float)
+            energy_wms_dict = defaultdict(float)
+
+            for op in model.generation_ops:
+                result = op.query(
+                    database,
+                    x=batch_size * beam_width,
+                    batch_size=batch_size,
+                    beam_width=beam_width,
+                    s=isl + i + 1,
+                    model_name=getattr(model, "model_name", ""),
+                    gen_seq_imbalance_correction_scale=runtime_config.gen_seq_imbalance_correction_scale,
+                )
+                latency_dict[op._name] += float(result)
+                energy_wms_dict[op._name] += getattr(result, "energy", 0.0)
+
+            repeat_count = min(stride, osl - 1 - i)
+            for op in latency_dict:
+                generation_latency_dict[op] += latency_dict[op] * repeat_count
+                generation_energy_wms_dict[op] += energy_wms_dict[op] * repeat_count
+
+        return generation_latency_dict, generation_energy_wms_dict
+
+    def _run_static_breakdown(
+        self,
+        model: BaseModel,
+        database: PerfDatabase,
+        runtime_config: RuntimeConfig,
+        mode: str,
+        stride: int = 32,
+        latency_correction_scale: float = 1.0,
+    ) -> tuple[dict[str, float], dict[str, float], dict[str, float], dict[str, float]]:
+        batch_size, beam_width, isl, osl, prefix = (
+            runtime_config.batch_size,
+            runtime_config.beam_width,
+            runtime_config.isl,
+            runtime_config.osl,
+            runtime_config.prefix,
+        )
+
+        context_latency_dict, context_energy_wms_dict = {}, {}
+        generation_latency_dict, generation_energy_wms_dict = {}, {}
+
+        if mode == "static_ctx":
+            context_latency_dict, context_energy_wms_dict = self._run_context_phase(
+                model, database, runtime_config, batch_size, isl, prefix
+            )
+        elif mode == "static_gen":
+            generation_latency_dict, generation_energy_wms_dict = self._run_generation_phase(
+                model, database, runtime_config, batch_size, beam_width, isl, osl, stride
+            )
+        else:
+            context_latency_dict, context_energy_wms_dict = self._run_context_phase(
+                model, database, runtime_config, batch_size, isl, prefix
+            )
+            generation_latency_dict, generation_energy_wms_dict = self._run_generation_phase(
+                model, database, runtime_config, batch_size, beam_width, isl, osl, stride
+            )
+
+        if latency_correction_scale != 1.0:
+            logger.debug(f"latency_correction_scale: {latency_correction_scale} is applied")
+            for op in context_latency_dict:
+                context_latency_dict[op] *= latency_correction_scale
+                context_energy_wms_dict[op] *= latency_correction_scale
+            for op in generation_latency_dict:
+                generation_latency_dict[op] *= latency_correction_scale
+                generation_energy_wms_dict[op] *= latency_correction_scale
+
+        return (
+            context_latency_dict,
+            context_energy_wms_dict,
+            generation_latency_dict,
+            generation_energy_wms_dict,
+        )
+
+    def run_static_latency_only(
+        self,
+        model: BaseModel,
+        database: PerfDatabase,
+        runtime_config: RuntimeConfig,
+        mode: str,
+        stride: int = 32,
+        latency_correction_scale: float = 1.0,
+    ) -> float:
+        """
+        Run static inference and return only the total latency in milliseconds.
+
+        This shares the same latency breakdown path as ``run_static`` but skips
+        building an ``InferenceSummary``.
+        """
+        (
+            context_latency_dict,
+            _,
+            generation_latency_dict,
+            _,
+        ) = self._run_static_breakdown(model, database, runtime_config, mode, stride, latency_correction_scale)
+        return sum(context_latency_dict.values()) + sum(generation_latency_dict.values())
 
     def run_static(
         self,
@@ -119,8 +266,10 @@ class BaseBackend(ABC):
                 x = batch_size * isl if "logits_gemm" not in op._name else batch_size
                 query_kwargs = dict(x=x, batch_size=batch_size, beam_width=1, s=isl, prefix=prefix)
 
-                # Forward AFD kwargs so MoEDispatch.query() can compute P2P comm
-                if isinstance(op, MoEDispatch) and op._enable_afd:
+                # Forward AFD kwargs so MoEDispatch.query() can compute P2P comm.
+                # Include them for wrapper ops too; OverlapOp forwards kwargs to
+                # its inner routed/shared ops.
+                if model.config.enable_afd:
                     query_kwargs["num_attn_gpus"] = model.config.num_attn_gpus
                     query_kwargs["num_ffn_gpus"] = model.config.num_ffn_gpus
 
@@ -140,67 +289,112 @@ class BaseBackend(ABC):
             batch_size: int, isl: int, prefix, num_microbatches: int,
         ) -> tuple[dict[str, float], dict[str, float]]:
             """
-            Models the AFD 4-stage pipeline:
+            Models the AFD 4-stage pipeline at per-microbatch granularity:
 
               Stage 1: Attention compute   (on attn GPUs)
               Stage 2: Comm attn → FFN     (P2P / MoE pre-dispatch)
               Stage 3: FFN compute         (on FFN GPUs)
               Stage 4: Comm FFN → attn     (MoE post-dispatch)
 
-              The pipeline formula is:
+            We treat each (microbatch, layer) pair as one task that visits all
+            4 stages.  Following the vLLM chunked-prefill pattern (see
+            ``vllm_backend._get_mix_step_latency``), each microbatch is
+            collapsed to a single combined batch of new tokens:
 
-              t_pipe = sum(stages)/M + (M-1)/M × max(stages)
+                mb_bs       = 1
+                mb_new_toks = batch_size · (isl - prefix) / M
 
-            At M=1 this equals the sequential sum.  As M→4 the pipeline
-            converges toward the bottleneck stage.  The pipeline runs across
-            all layers and stabilises after the initial fill.
+            With T = M · L tasks flowing through 4 distinct resource-stages,
+            the bottleneck stage processes all M microbatches back-to-back
+            (cost M · s_max).  Each non-max stage contributes one
+            per-(microbatch, layer) cost (= s_i / L) as a one-time fill bubble:
+
+              t_pipe = M · s_max + sum(s_i / L  for i in non-max stages)
+
+            The fill bubble is charged ONCE for the entire run (not once per
+            layer), matching MegaScale-Infer / Step-Fun cross-layer pipelining.
+            Measuring stages at per-microbatch shape (rather than full shape
+            then dividing) captures non-linear scaling of comm / small GEMMs.
 
             Returns the same (latency_dict, energy_dict) pair as ``_run_context``
             but with total latencies reflecting the pipelined schedule.
             """
-            M = min(num_microbatches, 4)  # cap at 4 stages (based on megascale-infer and step-fun)
+            assert num_microbatches == 4, "Currently only consider 4 microbatches to achieve steady state modeling"
+            M = max(num_microbatches, 1)
+            # Number of transformer layers participating in the pipeline.
+            # Both AFD groups should expose the same layer count.
+            L = getattr(_afd_attn_model, "_num_layers", None) or getattr(model, "_num_layers", 1)
 
-            # ---- Measure 4 stages at FULL batch_size (no splitting) ----
+            # ---- Split work across M microbatches (vLLM-style token chunking) ----
+            # Collapse to a single combined batch and slice along the token dim:
+            #   mb_bs = 1, mb_new_toks = batch_size * (isl - prefix) / M.
+            # Prefix is scaled by the number of full requests in the chunk
+            # (matches vllm_backend: ``prefix * floor(ctx_tokens / isl)``).
+            eff_isl = isl - prefix
+            if eff_isl <= 0:
+                raise ValueError(
+                    f"isl must be greater than 0 after removing prefix, but got {eff_isl}"
+                )
+            total_eff_tokens = batch_size * eff_isl
+            mb_eff_isl = max(total_eff_tokens // M, 1)
+            mb_prefix = int(prefix * (mb_eff_isl // eff_isl))
+            # _run_context internally computes effective_isl = isl - prefix,
+            # so re-add the (scaled) prefix when forwarding the per-mb isl.
+            mb_isl = mb_eff_isl + mb_prefix
+
+            # ---- Measure 4 stages at PER-MICROBATCH shape ----
+            # Each measurement is one microbatch's stage cost across all layers.
             # When heterogeneous AFD is active, each stage uses its group's
             # model (for op lists) and database (for perf queries).
             s1_lat, s1_energy = _run_context(
-                batch_size, isl, prefix,
+                1, mb_isl, mb_prefix,
                 ops=_afd_attn_model.context_attn_compute_ops, db=_afd_attn_db)
             s2_lat, s2_energy = _run_context(
-                batch_size, isl, prefix,
+                1, mb_isl, mb_prefix,
                 ops=_afd_attn_model.context_comm_a2f_ops, db=_afd_attn_db)
             s3_lat, s3_energy = _run_context(
-                batch_size, isl, prefix,
+                1, mb_isl, mb_prefix,
                 ops=_afd_ffn_model.context_ffn_compute_ops, db=_afd_ffn_db)
             s4_lat, s4_energy = _run_context(
-                batch_size, isl, prefix,
+                1, mb_isl, mb_prefix,
                 ops=_afd_ffn_model.context_comm_f2a_ops, db=_afd_ffn_db)
 
-            t = [sum(s.values()) for s in (s1_lat, s2_lat, s3_lat, s4_lat)]
-            t_sum = sum(t)
-            t_max = max(t)
+            s = [sum(d.values()) for d in (s1_lat, s2_lat, s3_lat, s4_lat)]
+            s_max = max(s)
 
-            # Pipeline formula:
-            # t_pipe = sum(stages)/M + (M-1)/M × max(stages)
-            t_pipelined = t_sum / M + (M - 1) / M * t_max
+            # Pipeline formula (per-microbatch granularity):
+            #   t_pipe = M · s_max + sum(s_i / L  for i in non-max stages)
+            # The first term is the bottleneck stage processing all M microbatches
+            # back-to-back.  The second term is the pipeline-fill bubble: each
+            # non-max stage contributes one per-microbatch-per-layer cost
+            # (= s_i / L) before the bottleneck saturates.
+            bubble = sum(si for si in s if si != s_max) / L
+            t_pipelined = M * s_max + bubble
 
-            # Scale all ops proportionally so they sum to t_pipelined
-            scale = t_pipelined / t_sum if t_sum > 0 else 1.0
+            # Total sequential cost across M microbatches (no pipelining).
+            # Used only to scale per-op latencies so they sum to t_pipelined.
+            total_seq = M * sum(s)
+            scale = t_pipelined / total_seq if total_seq > 0 else 1.0
 
             pipelined_lat = defaultdict(float)
             pipelined_energy = defaultdict(float)
             for stage_lat, stage_energy in [(s1_lat, s1_energy), (s2_lat, s2_energy),
                                             (s3_lat, s3_energy), (s4_lat, s4_energy)]:
                 for op_name in stage_lat:
-                    pipelined_lat[op_name] = stage_lat[op_name] * scale
-                    pipelined_energy[op_name] = stage_energy.get(op_name, 0.0)
+                    # Latency: M microbatches' worth of this op, scaled to t_pipelined.
+                    pipelined_lat[op_name] = stage_lat[op_name] * M * scale
+                    # Energy is additive across microbatches; pipelining reorders
+                    # but does not reduce work.
+                    pipelined_energy[op_name] = stage_energy.get(op_name, 0.0) * M
 
             stage_names = ["attn_compute", "comm_a2f", "ffn_compute", "comm_f2a"]
             logger.debug(
-                f"AFD 4-stage pipelined context: M={M}, "
-                + ", ".join(f"{n}={v:.3f}ms" for n, v in zip(stage_names, t))
-                + f", t_pipelined={t_pipelined:.3f}ms vs t_sequential={t_sum:.3f}ms "
-                + f"(speedup={t_sum / t_pipelined:.2f}x)"
+                f"AFD 4-stage pipelined context (per-mb): M={M}, L={L}, "
+                f"mb_bs=1, mb_eff_isl={mb_eff_isl}, mb_prefix={mb_prefix} "
+                f"(total_eff_tokens={total_eff_tokens}), "
+                + ", ".join(f"{n}={v:.3f}ms" for n, v in zip(stage_names, s))
+                + f", t_pipelined={t_pipelined:.3f}ms (M·s_max={M*s_max:.3f}ms + bubble={bubble:.3f}ms) "
+                + f"vs t_sequential={total_seq:.3f}ms (speedup={total_seq / t_pipelined:.2f}x)"
             )
 
             return pipelined_lat, pipelined_energy
@@ -210,48 +404,54 @@ class BaseBackend(ABC):
             num_microbatches: int,
         ) -> tuple[dict[str, float], dict[str, float]]:
             """
-            Run generation phase with a 4-stage AFD inter-layer pipeline.
-
-            Same model as context but applied to decode steps.
+            Run generation phase with a 4-stage AFD cross-layer pipeline,
+            modelled at per-microbatch granularity.  See
+            ``_run_context_afd_pipelined`` for the formula derivation.
             """
-            M = min(num_microbatches, 4)  # cap at 4 stages
-
-            # When heterogeneous AFD is active, each stage uses its group's
-            # model (for op lists) and database (for perf queries).
+            # For generation, the only chunkable dim is batch (1 new token/seq per step).
+            # Cap M so each microbatch has at least 1 sequence; if batch_size < requested M,
+            # reduce M to batch_size (degenerate M=1 → equivalent to non-pipelined).
+            M = max(min(num_microbatches, batch_size), 1)
+            L = getattr(_afd_attn_model, "_num_layers", None) or getattr(model, "_num_layers", 1)
+            mb_bs = max(batch_size // M, 1)
             s1_lat, s1_energy = _run_generation(
-                batch_size, beam_width, isl, osl, stride,
+                mb_bs, beam_width, isl, osl, stride,
                 ops=_afd_attn_model.generation_attn_compute_ops, db=_afd_attn_db)
             s2_lat, s2_energy = _run_generation(
-                batch_size, beam_width, isl, osl, stride,
+                mb_bs, beam_width, isl, osl, stride,
                 ops=_afd_attn_model.generation_comm_a2f_ops, db=_afd_attn_db)
             s3_lat, s3_energy = _run_generation(
-                batch_size, beam_width, isl, osl, stride,
+                mb_bs, beam_width, isl, osl, stride,
                 ops=_afd_ffn_model.generation_ffn_compute_ops, db=_afd_ffn_db)
             s4_lat, s4_energy = _run_generation(
-                batch_size, beam_width, isl, osl, stride,
+                mb_bs, beam_width, isl, osl, stride,
                 ops=_afd_ffn_model.generation_comm_f2a_ops, db=_afd_ffn_db)
 
-            t = [sum(s.values()) for s in (s1_lat, s2_lat, s3_lat, s4_lat)]
-            t_sum = sum(t)
-            t_max = max(t)
+            s = [sum(d.values()) for d in (s1_lat, s2_lat, s3_lat, s4_lat)]
+            s_max = max(s)
 
-            t_pipelined = t_sum / M + (M - 1) / M * t_max
+            # Pipeline formula (per-microbatch granularity):
+            #   t_pipe = M · s_max + sum(s_i / L  for i in non-max stages)
+            bubble = sum(si for si in s if si != s_max) / L
+            t_pipelined = M * s_max + bubble
 
-            scale = t_pipelined / t_sum if t_sum > 0 else 1.0
+            total_seq = M * sum(s)
+            scale = t_pipelined / total_seq if total_seq > 0 else 1.0
 
             pipelined_lat = defaultdict(float)
             pipelined_energy = defaultdict(float)
             for stage_lat, stage_energy in [(s1_lat, s1_energy), (s2_lat, s2_energy),
                                             (s3_lat, s3_energy), (s4_lat, s4_energy)]:
                 for op_name in stage_lat:
-                    pipelined_lat[op_name] = stage_lat[op_name] * scale
-                    pipelined_energy[op_name] = stage_energy.get(op_name, 0.0)
+                    pipelined_lat[op_name] = stage_lat[op_name] * M * scale
+                    pipelined_energy[op_name] = stage_energy.get(op_name, 0.0) * M
 
             stage_names = ["attn_compute", "comm_a2f", "ffn_compute", "comm_f2a"]
             logger.debug(
-                f"AFD 4-stage pipelined generation: M={M}, "
-                + ", ".join(f"{n}={v:.3f}ms" for n, v in zip(stage_names, t))
-                + f", t_pipelined={t_pipelined:.3f}ms vs t_sequential={t_sum:.3f}ms"
+                f"AFD 4-stage pipelined generation (per-mb): M={M}, L={L}, mb_bs={mb_bs}, "
+                + ", ".join(f"{n}={v:.3f}ms" for n, v in zip(stage_names, s))
+                + f", t_pipelined={t_pipelined:.3f}ms (M·s_max={M*s_max:.3f}ms + bubble={bubble:.3f}ms) "
+                + f"vs t_sequential={total_seq:.3f}ms"
             )
 
             return pipelined_lat, pipelined_energy
@@ -297,8 +497,10 @@ class BaseBackend(ABC):
                         s=isl + i + 1,
                     )
 
-                    # Forward AFD kwargs so MoEDispatch.query() can compute P2P comm
-                    if isinstance(op, MoEDispatch) and op._enable_afd:
+                    # Forward AFD kwargs so MoEDispatch.query() can compute P2P comm.
+                    # Include them for wrapper ops too; OverlapOp forwards kwargs to
+                    # its inner routed/shared ops.
+                    if model.config.enable_afd:
                         query_kwargs["num_attn_gpus"] = model.config.num_attn_gpus
                         query_kwargs["num_ffn_gpus"] = model.config.num_ffn_gpus
 
@@ -329,10 +531,6 @@ class BaseBackend(ABC):
             runtime_config.osl,
             runtime_config.prefix,
         )
-
-        # Execute phases (UPDATED to return energy_wms dicts)
-        context_latency_dict, context_energy_wms_dict = {}, {}
-        generation_latency_dict, generation_energy_wms_dict = {}, {}
 
         # ----- AFD (Attention-FFN Disaggregation) support -----
         
@@ -376,6 +574,11 @@ class BaseBackend(ABC):
             "static_gen_attn": (_afd_attn_model, "generation_attn_ops", _afd_attn_db),
             "static_gen_ffn":  (_afd_ffn_model,  "generation_ffn_ops",  _afd_ffn_db),
         }
+
+        context_latency_dict = defaultdict(float)
+        context_energy_wms_dict = defaultdict(float)
+        generation_latency_dict = defaultdict(float)
+        generation_energy_wms_dict = defaultdict(float)
 
         if mode in _afd_ctx_ops_db:
             _m, _attr, _db = _afd_ctx_ops_db[mode]
@@ -594,7 +797,7 @@ class BaseBackend(ABC):
         models it returns the KV bytes owned by a single TP rank, not the total
         logical KV bytes for the request.
         """
-        if model.model_family == "DEEPSEEK":
+        if model.model_family in ("DEEPSEEK", "DEEPSEEKV32"):
             kvcache_per_token = model._num_layers * 576
         else:
             num_kv_heads_per_gpu = (model._num_kv_heads + model.config.tp_size - 1) // model.config.tp_size
@@ -641,7 +844,7 @@ class BaseBackend(ABC):
         for the request at the prefill/decode boundary, so callers can
         distribute or reshape it across TP ranks without double-dividing by TP.
         """
-        if model.model_family == "DEEPSEEK":
+        if model.model_family in ("DEEPSEEK", "DEEPSEEKV32"):
             # DeepSeek MLA uses a separate compressed KV representation. The
             # current model treats the 576-byte latent as the logical per-layer
             # cache unit, so keep transfer sizing aligned with the existing MLA
@@ -754,8 +957,13 @@ class BaseBackend(ABC):
         isl: int,
         osl: int,
         num_tokens: int = 0,
+        prefix: int = 0,
     ) -> dict[str, float]:
         """
         Get the memory usage of the backend.
+
+        Args:
+            prefix: number of prefix tokens (part of isl) whose KV is already cached
+                (per-request) and does not need activation computation.
         """
         pass

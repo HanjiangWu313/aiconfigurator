@@ -4,13 +4,24 @@
 import importlib.resources as pkg_resources
 import json
 import logging
+import os
 import re
 import tempfile
 import urllib.request
+from functools import cache
 from pathlib import Path
 
+import yaml
+
 from aiconfigurator.sdk import common
-from aiconfigurator.sdk.common import ARCHITECTURE_TO_MODEL_FAMILY, BlockConfig, DefaultHFModels
+from aiconfigurator.sdk.common import (
+    ARCHITECTURE_TO_MODEL_FAMILY,
+    MULTIMODAL_TEXT_CONFIG_KEY,
+    BlockConfig,
+    DefaultHFModels,
+    HybridMoEConfig,
+    Qwen35Config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +43,61 @@ def _load_json_with_infinity(file_path) -> dict:
     return json.loads(content)
 
 
+def filter_real_silicon_configs(
+    parallel_config_list: list[list[int]],
+    *,
+    is_moe: bool = False,
+    min_num_gpus: int | None = None,
+    max_num_gpus: int | None = None,
+    allow_moe_pure_tp: bool = True,
+) -> list[list[int]]:
+    """Filter parallel configs for real-silicon sweep runs.
+
+    Applies GPU count bounds and, for MoE models, restricts configs to pure
+    TEP, pure DEP, and optionally pure TP patterns.
+
+    Args:
+        parallel_config_list: List of ``[tp, pp, dp, moe_tp, moe_ep]`` configs.
+        is_moe: Whether the model is MoE.
+        min_num_gpus: Minimum total GPUs per config (inclusive).
+        max_num_gpus: Maximum total GPUs per config (inclusive).
+        allow_moe_pure_tp: When ``True`` (default, GQA+MoE models), pure TP
+            configs are kept.  Set to ``False`` for MLA+MoE models (e.g.
+            DeepSeek) to only allow TEP/DEP.
+
+    Returns:
+        Filtered list of parallel configurations.
+    """
+    filtered = []
+    for cfg in parallel_config_list:
+        tp, pp, dp, _moe_tp, _moe_ep = cfg
+        total_gpus = tp * pp * dp
+
+        # GPU count bounds
+        if min_num_gpus is not None and total_gpus < min_num_gpus:
+            continue
+        if max_num_gpus is not None and total_gpus > max_num_gpus:
+            continue
+
+        # For MoE: only allow pure TEP, pure DEP, and optionally pure TP.
+        # - Pure TEP: tp > 1, dp == 1, moe_tp == 1, moe_ep > 1
+        # - Pure DEP: tp == 1, dp > 1, moe_tp == 1, moe_ep > 1
+        # - Pure TP:  tp > 1, dp == 1, moe_tp > 1, moe_ep == 1
+        #   (only for GQA+MoE; disabled for MLA+MoE via allow_moe_pure_tp=False)
+        # Reject any config that doesn't match one of these patterns.
+        if is_moe:
+            is_pure_tep = tp > 1 and dp == 1 and _moe_tp == 1 and _moe_ep > 1
+            is_pure_dep = tp == 1 and dp > 1 and _moe_tp == 1 and _moe_ep > 1
+            is_pure_tp = tp > 1 and dp == 1 and _moe_tp > 1 and _moe_ep == 1
+            if not allow_moe_pure_tp:
+                is_pure_tp = False
+            if not (is_pure_tep or is_pure_dep or is_pure_tp):
+                continue
+
+        filtered.append(cfg)
+    return filtered
+
+
 def enumerate_parallel_config(
     num_gpu_list: list[int],
     tp_list: list[int],
@@ -43,6 +109,11 @@ def enumerate_parallel_config(
     backend: common.BackendName = common.BackendName.trtllm,
     enable_wideep: bool = False,
     enable_afd: bool = False,
+    moe_backend: str | None = None,
+    real_silicon_sweep: bool = False,
+    min_num_gpus: int | None = None,
+    max_num_gpus: int | None = None,
+    allow_moe_pure_tp: bool = True,
 ) -> list[list[int]]:
     """
     Enumerate parallel configurations based on parallel list.
@@ -62,9 +133,20 @@ def enumerate_parallel_config(
         enable_afd: when True, attention and FFN GPUs are decoupled.
             num_total_gpus = (tp*dp + moe_tp*moe_ep) and the constraint
             tp*dp == moe_tp*moe_ep is relaxed.
+        real_silicon_sweep: when True, exclude PP (force pp_list=[1]) and filter by
+            min_num_gpus/max_num_gpus bounds on total GPUs per config. For MoE models,
+            only allows pure TEP, pure DEP, and (optionally) pure TP.
+        min_num_gpus: minimum total GPUs per config (only applied when real_silicon_sweep=True).
+        max_num_gpus: maximum total GPUs per config (only applied when real_silicon_sweep=True).
+        allow_moe_pure_tp: when True (default, GQA+MoE models), pure TP configs are kept.
+            Set to False for MLA+MoE models (e.g. DeepSeek) to only allow TEP/DEP.
+            Only effective when real_silicon_sweep=True.
     Returns:
         parallel_config_list: list of parallel configurations
     """
+    if real_silicon_sweep:
+        pp_list = [1]
+
     parallel_config_list = []
     for tp in tp_list:
         for pp in pp_list:
@@ -91,20 +173,25 @@ def enumerate_parallel_config(
                                 continue
                             # sglang
                             elif backend == common.BackendName.sglang:
-                                if (enable_wideep and moe_tp > 1) or (
-                                    not enable_wideep and moe_ep > 1
-                                ):  # wideep only has ep
-                                    continue
-                            elif backend == common.BackendName.vllm:
-                                pass  # TODO
+                                if (enable_wideep or moe_backend == "deepep_moe") and moe_tp > 1:
+                                    continue  # DeepEP forces ep_size=tp_size, moe_tp must be 1
+                            elif backend == common.BackendName.vllm:  # noqa: SIM102
+                                if moe_tp > 1 and moe_ep > 1:
+                                    continue  # vllm does not support MoE TP and MoE EP simultaneously
                             parallel_config_list.append([tp, pp, dp, moe_tp, moe_ep])
             else:
                 if tp * pp in num_gpu_list:
                     parallel_config_list.append([tp, pp, 1, 1, 1])
 
-    for parallel_config in parallel_config_list:
-        tp, pp, dp, moe_tp, moe_ep = parallel_config
-        logger.info(f"Enumerated parallel config: tp={tp}, pp={pp}, dp={dp}, moe_tp={moe_tp}, moe_ep={moe_ep}")
+    # Apply real silicon sweep filters to reduce sweep time on real silicon
+    if real_silicon_sweep:
+        parallel_config_list = filter_real_silicon_configs(
+            parallel_config_list,
+            is_moe=is_moe,
+            min_num_gpus=min_num_gpus,
+            max_num_gpus=max_num_gpus,
+            allow_moe_pure_tp=allow_moe_pure_tp,
+        )
 
     return parallel_config_list
 
@@ -243,10 +330,54 @@ def safe_mkdir(target_path: str, exist_ok: bool = True) -> Path:
 
 class HuggingFaceDownloadError(Exception):
     """
-    Exception raised when a HuggingFace config.json file cannot be downloaded.
+    Exception raised when a HuggingFace JSON file cannot be downloaded.
     """
 
     pass
+
+
+def _get_hf_auth_headers() -> dict[str, str]:
+    """Return HTTP auth headers using the cached HuggingFace token, if available.
+
+    Token resolution order (first non-empty wins):
+    1. ``HF_TOKEN`` environment variable
+    2. ``HUGGING_FACE_HUB_TOKEN`` environment variable
+    3. ``~/.cache/huggingface/token`` file
+    """
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if not hf_token:
+        # Fall back to the token file written by `huggingface-cli login`
+        token_path = Path.home() / ".cache" / "huggingface" / "token"
+        if token_path.exists():
+            with open(token_path) as f:
+                hf_token = f.read().strip()
+    headers: dict[str, str] = {}
+    if hf_token:
+        headers["Authorization"] = f"Bearer {hf_token}"
+    return headers
+
+
+def _download_hf_json(hf_id: str, filename: str, *, raise_on_404: bool = True) -> dict | None:
+    """Download and parse a JSON file from a HuggingFace model repo."""
+    url = f"https://huggingface.co/{hf_id}/raw/main/{filename}"
+    try:
+        req = urllib.request.Request(url, headers=_get_hf_auth_headers())
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as e:
+        if e.code == 404 and not raise_on_404:
+            return None
+        token_path = Path.home() / ".cache" / "huggingface" / "token"
+        raise HuggingFaceDownloadError(
+            f"Failed to download {hf_id}'s {filename} from HuggingFace: "
+            f"HuggingFace returned HTTP error {e.code}: {e.reason}. "
+            f"URL: {url}. If using a gated model, authenticate via one of the following "
+            f"(in priority order): (1) set the HF_TOKEN environment variable, "
+            f"(2) set the HUGGING_FACE_HUB_TOKEN environment variable, or "
+            f"(3) run `huggingface-cli login` (token stored at {token_path})."
+        ) from e
+    except Exception as e:
+        raise HuggingFaceDownloadError(f"Failed to download {hf_id}'s {filename} from HuggingFace: {e}") from e
 
 
 def _download_hf_config(hf_id: str) -> dict:
@@ -262,31 +393,7 @@ def _download_hf_config(hf_id: str) -> dict:
     Raises:
         HuggingFaceDownloadError: If the HuggingFace API returns an error
     """
-    url = f"https://huggingface.co/{hf_id}/raw/main/config.json"
-
-    # Load token from ~/.cache/huggingface/token, if available
-    token_path = Path.home() / ".cache" / "huggingface" / "token"
-    hf_token = None
-    if token_path.exists():
-        with open(token_path) as f:
-            hf_token = f.read().strip()
-    headers = {}
-    if hf_token:
-        headers["Authorization"] = f"Bearer {hf_token}"
-
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=30) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as e:
-        # Provide detailed error for any HTTP error code
-        raise HuggingFaceDownloadError(
-            f"Failed to download {hf_id}'s config.json from HuggingFace: "
-            f"HuggingFace returned HTTP error {e.code}: {e.reason}. "
-            f"URL: {url}. Check your authentication token in {token_path} if using a gated model."
-        ) from e
-    except Exception as e:
-        raise HuggingFaceDownloadError(f"Failed to download {hf_id}'s config.json from HuggingFace: {e}") from e
+    return _download_hf_json(hf_id, "config.json", raise_on_404=True) or {}
 
 
 def _parse_nemotron_block_configs(block_configs: list[dict]) -> list[BlockConfig]:
@@ -350,22 +457,41 @@ def _parse_nemotron_block_configs(block_configs: list[dict]) -> list[BlockConfig
     return grouped_configs if grouped_configs else None
 
 
-def _parse_hf_config_json(config: dict) -> list:
+def _parse_hf_config_json(config: dict) -> dict:
     """
-    Convert a HuggingFace config.json dictionary into a list of model configuration parameters:
-    [architecture, l, n, n_kv, d, hidden_size, inter_size, vocab, context, topk,
-    num_experts, moe_inter_size, extra_params]
+    Convert a HuggingFace config.json dictionary into model configuration parameters.
 
     Args:
         config: HuggingFace config.json dictionary
 
     Returns:
-        list: Model configuration parameters
+        dict: Model configuration parameters
 
     Raises:
         ValueError: If a required field is missing from the config or the architecture is not supported
     """
     architecture = config["architectures"][0]
+
+    # For multimodal models, unwrap the nested text config so that all LLM
+    # parameters (layers, hidden_size, MoE fields, etc.) are read from the
+    # correct sub-dictionary while keeping the top-level architecture name.
+    text_key = MULTIMODAL_TEXT_CONFIG_KEY.get(architecture)
+    if text_key and text_key in config:
+        text_cfg = config[text_key]
+        if not isinstance(text_cfg, dict):
+            raise ValueError(
+                f"Expected '{text_key}' to be a dict for architecture {architecture}, got {type(text_cfg).__name__}"
+            )
+        logger.info(
+            "Multimodal model detected (%s). Reading LLM parameters from '%s'.",
+            architecture,
+            text_key,
+        )
+        # Merge quantization_config from text_config if not present at top level
+        if "quantization_config" not in config and "quantization_config" in text_cfg:
+            config["quantization_config"] = text_cfg["quantization_config"]
+        config = {**text_cfg, **{"architectures": [architecture]}}
+
     if architecture not in ARCHITECTURE_TO_MODEL_FAMILY:
         raise ValueError(
             f"The model's architecture {architecture} is not supported. "
@@ -410,28 +536,125 @@ def _parse_hf_config_json(config: dict) -> list:
             f"NemotronH hybrid config: pattern={extra_params.hybrid_override_pattern}, "
             f"mamba_heads={extra_params.mamba_num_heads}"
         )
+    elif architecture == "DeciLMForCausalLM":
+        if "block_configs" in config:
+            extra_params = _parse_nemotron_block_configs(config["block_configs"])
+    elif architecture == "MiMoV2FlashForCausalLM":
+        # MiMo-V2-Flash: per-layer attention + FFN patterns; different dims for SWA vs global.
+        moe_layer_freq_raw = config.get("moe_layer_freq", [])
+        moe_layer_freq = (
+            tuple(moe_layer_freq_raw) if isinstance(moe_layer_freq_raw, list) else tuple([moe_layer_freq_raw] * layers)
+        )
+        attn_pattern = tuple(config.get("hybrid_layer_pattern", []))
+        if len(attn_pattern) != layers or len(moe_layer_freq) != layers:
+            raise ValueError(
+                f"Hybrid pattern length mismatch for {architecture}: "
+                f"expected {layers} entries, got attn={len(attn_pattern)} moe={len(moe_layer_freq)}"
+            )
+        if any(v not in (0, 1) for v in (*attn_pattern, *moe_layer_freq)):
+            raise ValueError(f"Hybrid patterns for {architecture} must contain only 0/1 values")
+        extra_params = HybridMoEConfig(
+            attn_layer_pattern=attn_pattern,
+            moe_layer_freq=moe_layer_freq,
+            swa_num_kv_heads=config.get("swa_num_key_value_heads", 0),
+            swa_head_dim=config.get("swa_head_dim", 0),
+            swa_v_head_dim=config.get("swa_v_head_dim", 0),
+            global_v_head_dim=config.get("v_head_dim", 0),
+            sliding_window_size=config.get("sliding_window_size", 0),
+            dense_inter_size=0,  # dense layers use model-level inter_size
+        )
+        logger.info(
+            f"MiMo-V2-Flash hybrid config: "
+            f"global_attn_layers={sum(extra_params.attn_layer_pattern)}, "
+            f"swa_layers={extra_params.attn_layer_pattern.count(0)}, "
+            f"moe_layers={sum(extra_params.moe_layer_freq)}, "
+            f"dense_layers={extra_params.moe_layer_freq.count(0)}"
+        )
+    elif architecture == "Llama4ForConditionalGeneration":
+        # Llama 4: step-based patterns — generate normalized per-layer tuples.
+        # Attention: even layers → local (0), odd layers → global (1).
+        # FFN: layer i is MoE (1) if (i+1) % interleave_moe_layer_step == 0, else dense (0).
+        step = config.get("interleave_moe_layer_step", 1)
+        if not isinstance(step, int) or step <= 0:
+            raise ValueError(f"interleave_moe_layer_step must be a positive integer, got {step}")
+        attn_pattern = tuple(i % 2 for i in range(layers))
+        moe_freq = tuple(1 if (i + 1) % step == 0 else 0 for i in range(layers))
+        extra_params = HybridMoEConfig(
+            attn_layer_pattern=attn_pattern,
+            moe_layer_freq=moe_freq,
+            # All attention dims are uniform (0 → fall back to model-level defaults).
+            sliding_window_size=config.get("attention_chunk_size", 0),
+            dense_inter_size=config.get("intermediate_size_mlp", 0),
+        )
+        logger.info(
+            f"Llama4 hybrid config: interleave_moe_layer_step={step}, "
+            f"global_attn_layers={sum(attn_pattern)}, local_attn_layers={attn_pattern.count(0)}, "
+            f"moe_layers={sum(moe_freq)}, dense_layers={moe_freq.count(0)}, "
+            f"sliding_window_size={extra_params.sliding_window_size}"
+        )
+    elif architecture == "KimiK25ForConditionalGeneration":
+        # KIMI K2.5 wraps a DeepSeek-V3-style MLA text model. Store v_head_dim so
+        # DeepSeekModel can use the correct attention head size (128) for vLLM's
+        # standard-attention path, instead of the generic hidden_size // n_heads = 112.
+        extra_params = {
+            "v_head_dim": config.get("v_head_dim", 0),
+        }
+    elif architecture in {"DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"}:
+        # DeepSeek-V3.2 / GLM-5 share the DSA attention pattern but have different
+        # projection/indexer dimensions, so keep these structural fields attached
+        # to the parsed config for model construction and perf-database lookup.
+        extra_params = {
+            "q_lora_rank": config["q_lora_rank"],
+            "kv_lora_rank": config["kv_lora_rank"],
+            "qk_nope_head_dim": config["qk_nope_head_dim"],
+            "qk_rope_head_dim": config["qk_rope_head_dim"],
+            "v_head_dim": config["v_head_dim"],
+            "index_head_dim": config["index_head_dim"],
+            "index_n_heads": config["index_n_heads"],
+            "index_topk": config["index_topk"],
+        }
+    elif architecture in {"Qwen3ForCausalLM", "Qwen3MoeForCausalLM"}:
+        # Qwen3-family attention may include additional Q/K normalization.
+        extra_params = {"architecture": architecture, "use_qk_norm": True}
+    elif architecture in {"Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration"}:
+        # Qwen3.5 hybrid GDN + full-attention model.
+        layer_types_raw = config.get("layer_types", [])
+        if len(layer_types_raw) != layers:
+            raise ValueError(f"Qwen3.5 layer_types length {len(layer_types_raw)} != num_hidden_layers {layers}")
+        extra_params = Qwen35Config(
+            layer_types=tuple(layer_types_raw),
+            linear_num_key_heads=config["linear_num_key_heads"],
+            linear_key_head_dim=config["linear_key_head_dim"],
+            linear_num_value_heads=config["linear_num_value_heads"],
+            linear_value_head_dim=config["linear_value_head_dim"],
+            linear_conv_kernel_dim=config["linear_conv_kernel_dim"],
+            topk=topk,
+            num_experts=num_experts,
+            moe_inter_size=moe_inter_size,
+            shared_expert_inter_size=config.get("shared_expert_intermediate_size", 0),
+        )
+        logger.info(
+            f"Qwen3.5 hybrid config: architecture={architecture}, "
+            f"linear_attn_layers={extra_params.layer_types.count('linear_attention')}, "
+            f"full_attn_layers={extra_params.layer_types.count('full_attention')}, "
+            f"num_experts={extra_params.num_experts}"
+        )
 
-    logger.info(
-        f"Model architecture: architecture={architecture}, layers={layers}, n={n}, n_kv={n_kv}, d={d}, "
-        f"hidden_size={hidden_size}, inter_size={inter_size}, vocab={vocab}, context={context}, "
-        f"topk={topk}, num_experts={num_experts}, moe_inter_size={moe_inter_size}, "
-        f"extra_params={'present' if extra_params else 'None'}"
-    )
-    return [
-        architecture,
-        layers,
-        n,
-        n_kv,
-        d,
-        hidden_size,
-        inter_size,
-        vocab,
-        context,
-        topk,
-        num_experts,
-        moe_inter_size,
-        extra_params,
-    ]
+    return {
+        "architecture": architecture,
+        "layers": layers,
+        "n": n,
+        "n_kv": n_kv,
+        "d": d,
+        "hidden_size": hidden_size,
+        "inter_size": inter_size,
+        "vocab": vocab,
+        "context": context,
+        "topk": topk,
+        "num_experts": num_experts,
+        "moe_inter_size": moe_inter_size,
+        "extra_params": extra_params,
+    }
 
 
 def _get_model_config_path():
@@ -442,9 +665,18 @@ def _get_model_config_path():
 
 
 def _load_pre_downloaded_hf_config(hf_id: str) -> dict:
+    """Load a cached HuggingFace config.json from the model_configs package directory."""
     config_path = _get_model_config_path() / f"{hf_id.replace('/', '--')}_config.json"
     if not config_path.exists():
         raise ValueError(f"HuggingFace model {hf_id} is not cached in model_configs directory.")
+    return _load_json_with_infinity(config_path)
+
+
+def _load_pre_downloaded_hf_quant_config(hf_id: str) -> dict | None:
+    """Load a cached hf_quant_config.json, returning None if not present."""
+    config_path = _get_model_config_path() / f"{hf_id.replace('/', '--')}_hf_quant_config.json"
+    if not config_path.exists():
+        return None
     return _load_json_with_infinity(config_path)
 
 
@@ -456,7 +688,265 @@ def _load_local_config(path: str) -> dict:
     return _load_json_with_infinity(config_path)
 
 
-def get_model_config_from_model_path(model_path: str) -> list:
+def _load_local_quant_config(path: str) -> dict | None:
+    """Load hf_quant_config.json from a local directory path if present."""
+    config_path = Path(path) / "hf_quant_config.json"
+    if not config_path.exists():
+        return None
+    return _load_json_with_infinity(config_path)
+
+
+def _normalize_hf_quant_config(hf_quant_config: dict) -> dict:
+    """Extract and normalize quant_method/kv_cache_quant_method from hf_quant_config."""
+    quant_section = hf_quant_config.get("quantization")
+    if not isinstance(quant_section, dict):
+        return {}
+    quant_algo = quant_section.get("quant_algo") or quant_section.get("quantization_algo")
+    kv_algo = quant_section.get("kv_cache_quant_algo")
+    normalized: dict[str, str] = {}
+    if quant_algo:
+        normalized["quant_method"] = str(quant_algo).lower()
+    if kv_algo:
+        normalized["kv_cache_quant_method"] = str(kv_algo).lower()
+    return normalized
+
+
+def _normalize_quant_algo(value: object) -> str | None:
+    """Normalize a quantization algorithm string to a canonical form."""
+    if value is None:
+        return None
+    algo = str(value).strip().lower()
+    if not algo:
+        return None
+    aliases = {
+        "fp8": "fp8",
+        "fp8_block": "fp8_block",
+        "nvfp4": "nvfp4",
+        "mxfp4": "mxfp4",
+        "w4a16_mxfp4": "mxfp4",
+        # compressed-tensors: pass through as-is so models.py can handle it with
+        # the correct partial-quantization semantics (MoE experts only, not all Linear layers).
+        "compressed-tensors": "compressed-tensors",
+    }
+    return aliases.get(algo, algo)
+
+
+def _categorize_ignore_pattern(pattern: str) -> set[str]:
+    """Return the set of layer categories covered by a single compressed-tensors ignore pattern.
+
+    Recognized categories:
+        ``"attention"``       — self-attention projections (q/k/v/o)
+        ``"routing_experts"`` — MoE routing-expert FFN weights
+        ``"shared_experts"``  — shared-expert FFN weights
+        ``"dense_mlp"``       — dense (non-MoE) FFN projections
+        ``"lm_head"``         — vocabulary projection
+    """
+    p = str(pattern).lower()
+    categories: set[str] = set()
+
+    if any(kw in p for kw in ("self_attn", "q_proj", "k_proj", "v_proj", "o_proj")):
+        categories.add("attention")
+
+    # shared_expert must be checked before the generic expert check
+    if "shared_expert" in p:
+        categories.add("shared_experts")
+    elif "expert" in p:
+        categories.add("routing_experts")
+
+    if "lm_head" in p:
+        categories.add("lm_head")
+
+    # Dense MLP: pattern mentions "mlp" and a projection suffix, but not experts.
+    # Matches both literal paths ("mlp.gate_proj") and regex groups ("mlp\.(gate|up|down)_proj").
+    if "mlp" in p and "_proj" in p and "expert" not in p:
+        categories.add("dense_mlp")
+
+    return categories
+
+
+def parse_compressed_tensors_quant(
+    quantization_config: dict | None,
+) -> tuple[str | None, frozenset[str]]:
+    """Parse a compressed-tensors ``quantization_config`` dict.
+
+    Returns ``(base_algo, ignored_categories)`` where:
+
+    - ``base_algo``: weight quantization algorithm (``"int4_wo"``, ``"int8_wo"``,
+      ``"fp8"``), or ``None`` when the config carries no quantization information.
+    - ``ignored_categories``: frozenset of layer-category names excluded from
+      quantization (i.e. remaining in float16/bfloat16).  Empty when nothing is
+      ignored or when ``base_algo`` is ``None``.
+
+    The caller is responsible for mapping categories to SDK quant-mode fields.
+    Recognized categories: ``"attention"``, ``"routing_experts"``,
+    ``"shared_experts"``, ``"dense_mlp"``, ``"lm_head"``.
+    """
+    if not isinstance(quantization_config, dict):
+        return None, frozenset()
+
+    # Derive base algo from the first config_group's weight spec.
+    base_algo: str | None = None
+    for group in (quantization_config.get("config_groups") or {}).values():
+        weights = (group or {}).get("weights") or {}
+        num_bits = weights.get("num_bits")
+        w_type = str(weights.get("type", "")).lower()
+        if isinstance(num_bits, int):
+            if num_bits == 4 and "int" in w_type:
+                base_algo = "int4_wo"
+            elif num_bits == 8 and "int" in w_type:
+                base_algo = "int8_wo"
+            elif num_bits == 8 and "float" in w_type:
+                base_algo = "fp8"
+        if base_algo:
+            break
+
+    if base_algo is None:
+        return None, frozenset()
+
+    ignored: set[str] = set()
+    for pattern in quantization_config.get("ignore") or []:
+        ignored |= _categorize_ignore_pattern(pattern)
+
+    return base_algo, frozenset(ignored)
+
+
+def _normalize_kv_cache_algo(value: object) -> str | None:
+    """Normalize a KV cache quantization algorithm string."""
+    if value is None:
+        return None
+    algo = str(value).strip().lower()
+    if not algo:
+        return None
+    if algo in {"fp8", "e4m3", "e5m2"}:
+        return "fp8"
+    if algo in {"fp16", "float16", "bf16", "bfloat16"}:
+        return "bfloat16"
+    return algo
+
+
+def _infer_quant_dynamic(quant_cfg: dict) -> bool | None:
+    """
+    Args:
+        quant_cfg: The quantization configuration of config.json
+
+    Returns:
+        bool | None: The quantization dynamic
+    """
+    activation_scheme = str(quant_cfg.get("activation_scheme", "")).lower()
+    if activation_scheme:
+        if activation_scheme == "dynamic":
+            return True
+        if activation_scheme == "static":
+            return False
+
+    config_groups = quant_cfg.get("config_groups")
+    if isinstance(config_groups, dict):
+        found_dynamic = []
+        for group in config_groups.values():
+            if not isinstance(group, dict):
+                continue
+            for key in ("input_activations", "weights"):
+                item = group.get(key)
+                if isinstance(item, dict) and "dynamic" in item:
+                    found_dynamic.append(bool(item.get("dynamic")))
+        if found_dynamic:
+            return any(found_dynamic)
+
+    return None
+
+
+def _infer_quantization_fields(raw_config: dict) -> dict[str, object]:
+    """Infer quant_method, kv_cache_quant_method, and quant_dynamic from config."""
+    quant_cfg = raw_config.get("quantization_config")
+    quant_cfg = quant_cfg if isinstance(quant_cfg, dict) else {}
+
+    hf_quant = raw_config.get("hf_quant_config")
+    hf_quant = hf_quant if isinstance(hf_quant, dict) else {}
+    hf_quant_section = hf_quant.get("quantization")
+    hf_quant_section = hf_quant_section if isinstance(hf_quant_section, dict) else {}
+
+    quant_algo = _normalize_quant_algo(
+        hf_quant_section.get("quant_algo")
+        or quant_cfg.get("quant_algo")
+        or quant_cfg.get("quant_method")
+        or quant_cfg.get("quantization_method")
+    )
+
+    kv_cache_algo = _normalize_kv_cache_algo(
+        hf_quant_section.get("kv_cache_quant_algo")
+        or quant_cfg.get("kv_cache_quant_algo")
+        or quant_cfg.get("kv_cache_quant_method")
+        or quant_cfg.get("kv_cache_dtype")
+    )
+
+    if kv_cache_algo is None:
+        kv_cache_scheme = quant_cfg.get("kv_cache_scheme")
+        if isinstance(kv_cache_scheme, dict):
+            scheme_type = str(kv_cache_scheme.get("type", "")).lower()
+            num_bits = kv_cache_scheme.get("num_bits")
+            if "fp8" in scheme_type:
+                kv_cache_algo = "fp8"
+            elif scheme_type == "float" and isinstance(num_bits, int):
+                # TODO: 4bit kv cache support
+                if num_bits <= 8:
+                    kv_cache_algo = "fp8"
+                elif num_bits >= 16:
+                    kv_cache_algo = "bfloat16"
+
+    weight_block_size = quant_cfg.get("weight_block_size") or []
+    if quant_algo == "fp8" and weight_block_size:
+        quant_algo = "fp8_block"
+
+    quant_dynamic = _infer_quant_dynamic(quant_cfg)
+
+    logger.info(
+        "Quant inference result: quant_algo=%s, kv_cache_quant_algo=%s, quant_dynamic=%s",
+        quant_algo,
+        kv_cache_algo,
+        quant_dynamic,
+    )
+
+    inferred: dict[str, object] = {}
+    if quant_algo:
+        inferred["quant_algo"] = quant_algo
+    if kv_cache_algo:
+        inferred["kv_cache_quant_algo"] = kv_cache_algo
+    if quant_dynamic is not None:
+        inferred["quant_dynamic"] = quant_dynamic
+    return inferred
+
+
+def _attach_inferred_quant_fields(raw_config: dict) -> dict:
+    """Attach inferred quantization fields to config, checking text_config for multimodal models."""
+    # For multimodal models the quantization_config may live under text_config.
+    # Promote it to the top level so downstream inference picks it up.
+    if "quantization_config" not in raw_config:
+        architecture = (raw_config.get("architectures") or [None])[0]
+        text_key = MULTIMODAL_TEXT_CONFIG_KEY.get(architecture)
+        if text_key:
+            nested = raw_config.get(text_key, {})
+            if isinstance(nested, dict) and "quantization_config" in nested:
+                raw_config["quantization_config"] = nested["quantization_config"]
+    inferred = _infer_quantization_fields(raw_config)
+    for key, value in inferred.items():
+        raw_config.setdefault(key, value)
+    return raw_config
+
+
+def _attach_hf_quant_config(raw_config: dict, hf_quant_config: dict | None) -> dict:
+    """Merge normalized hf_quant_config fields into raw_config if present."""
+    if not hf_quant_config:
+        return raw_config
+    raw_config["hf_quant_config"] = hf_quant_config
+    if "quantization_config" not in raw_config:
+        normalized = _normalize_hf_quant_config(hf_quant_config)
+        if normalized:
+            raw_config["quantization_config"] = normalized
+    return raw_config
+
+
+@cache
+def _load_model_config_from_model_path(model_path: str) -> dict:
     """
     Get model configuration from model path.
 
@@ -468,24 +958,133 @@ def get_model_config_from_model_path(model_path: str) -> list:
         model_path: HuggingFace model path or local directory path
 
     Returns:
-        list: Model configuration parameters
-              [architecture, layers, n, n_kv, d, hidden_size, inter_size, vocab, context,
-               topk, num_experts, moe_inter_size, extra_params]
+        dict: Raw model configuration dictionary
 
     Raises:
         ValueError: If the model config cannot be found
         HuggingFaceDownloadError: If fetching from HuggingFace fails
     """
-    import os
-
     # Check if it's a local path
     if os.path.isdir(model_path):
         config = _load_local_config(model_path)
-        return _parse_hf_config_json(config)
+        return _attach_inferred_quant_fields(_attach_hf_quant_config(config, _load_local_quant_config(model_path)))
 
     # Otherwise treat as HuggingFace path
     if model_path in DefaultHFModels:
         config = _load_pre_downloaded_hf_config(model_path)
-    else:
-        config = _download_hf_config(model_path)
-    return _parse_hf_config_json(config)
+        return _attach_inferred_quant_fields(
+            _attach_hf_quant_config(config, _load_pre_downloaded_hf_quant_config(model_path))
+        )
+
+    config = _download_hf_config(model_path)
+    try:
+        hf_quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False)
+    except Exception as exc:  # best-effort for optional quant config
+        logger.debug("Failed to download hf_quant_config.json for %s: %s", model_path, exc)
+        hf_quant_config = None
+    return _attach_inferred_quant_fields(_attach_hf_quant_config(config, hf_quant_config))
+
+
+@cache
+def get_model_config_from_model_path(model_path: str) -> dict:
+    """
+    Get model configuration from model path and parse it into model configuration parameters.
+
+    Args:
+        model_path: HuggingFace model path or local directory path
+
+    Returns:
+        dict: Model configuration parameters and raw config under "raw_config".
+    """
+    raw_config = _load_model_config_from_model_path(model_path)
+    parsed = _parse_hf_config_json(raw_config)
+    logger.info(
+        "Loaded model config for %s: %s",
+        model_path,
+        ", ".join(f"{k}={v}" for k, v in parsed.items()),
+    )
+    parsed["raw_config"] = raw_config
+    return parsed
+
+
+class ListFlowDumper(yaml.SafeDumper):
+    """
+    Dumper that will print dict items on new lines, but lists on one line.
+    Example:
+        decode_worker_config:
+            backend_name: trtllm
+            backend_version: 1.2.0rc5
+            dp_list: [1]
+            num_gpu_per_worker: [1, 2, 4, 8]
+    """
+
+    pass
+
+
+def represent_list_flow(dumper, data):
+    return dumper.represent_sequence(
+        "tag:yaml.org,2002:seq",
+        data,
+        flow_style=True,  # force inline style
+    )
+
+
+ListFlowDumper.add_representer(list, represent_list_flow)
+
+
+# ---------------------------------------------------------------------------
+# Plain-text helpers (cat -v safe output)
+# ---------------------------------------------------------------------------
+
+_ANSI_ESCAPE_RE = re.compile(r"(?:\x1B[@-Z\\-_]|[\x80-\x9A\x9C-\x9F]|(?:\x1B\[|\x9B)[0-?]*[ -/]*[@-~])")
+
+# Compact mapping of Unicode characters emitted by plotext to ASCII.
+# Only the characters actually produced by plotext's "clear" theme are
+# included: box-drawing frame (U+2500 range), block/quadrant elements
+# used for sub-cell plotting, the bullet marker, and braille dots.
+_UNICODE_TO_ASCII = str.maketrans(
+    {
+        # Box-drawing (frame)
+        "\u2500": "-",
+        "\u2502": "|",
+        "\u250c": "+",
+        "\u2510": "+",
+        "\u2514": "+",
+        "\u2518": "+",
+        "\u251c": "+",
+        "\u2524": "+",
+        "\u252c": "+",
+        "\u2534": "+",
+        "\u253c": "+",
+        # Block elements
+        "\u2580": "-",
+        "\u2581": "_",
+        "\u2584": "_",
+        "\u2588": "#",
+        "\u258c": "|",
+        "\u2590": "|",
+        # Quadrant block elements
+        "\u2596": ".",
+        "\u2597": ".",
+        "\u2598": "'",
+        "\u2599": "|",
+        "\u259a": ":",
+        "\u259b": "|",
+        "\u259c": "|",
+        "\u259d": "'",
+        "\u259e": "/",
+        "\u259f": "|",
+        # Marker / bullet
+        "\u2022": "*",
+    }
+)
+
+
+def strip_unicode_to_ascii(text: str) -> str:
+    """Strip ANSI escapes and replace Unicode graphics with ASCII.
+
+    Intended for piped / redirected CLI output so that tools like
+    ``cat -v`` render clean text instead of M-bM-^T... mojibake.
+    """
+    text = _ANSI_ESCAPE_RE.sub("", text)
+    return text.translate(_UNICODE_TO_ASCII)

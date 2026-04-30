@@ -60,7 +60,7 @@ _BACKEND_INSTANCE = TRTLLMBackend()
 def perf_db():
     """Real PerfDatabase reading from actual system perf data."""
     systems_dir = get_system_config_path()
-    return PerfDatabase(_SYSTEM, _BACKEND, _VERSION, systems_dir=str(systems_dir))
+    return PerfDatabase(_SYSTEM, _BACKEND, _VERSION, systems_root=str(systems_dir))
 
 
 # ---------------------------------------------------------------------------
@@ -557,14 +557,13 @@ class TestMoEDispatchRuntime:
 
 
 def _classify_op_stage(op_name: str) -> str:
-    """Classify an op as 'attn' or 'ffn' using BaseModel's default classification."""
-    # Use BaseModel's default _ATTN_COMPONENTS (MOEModel inherits the same set)
-    name = op_name
-    for pfx in ("context_", "generation_"):
-        if name.startswith(pfx):
-            name = name[len(pfx):]
-            break
-    return "attn" if name in BaseModel._ATTN_COMPONENTS else "ffn"
+    """Classify an op as 'attn' or 'ffn' using BaseModel's substring classifier.
+
+    Single source of truth: delegate to ``BaseModel._is_attn_op`` so the test
+    classification stays in sync with the backend's own AFD partitioning.
+    """
+    _bm = BaseModel.__new__(BaseModel)
+    return "attn" if _bm._is_attn_op(op_name) else "ffn"
 
 
 class TestDisaggAFDBreakdown:

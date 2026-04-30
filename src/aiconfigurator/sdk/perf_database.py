@@ -18,19 +18,12 @@ import yaml
 from scipy import interpolate
 
 from aiconfigurator.sdk import common
+from aiconfigurator.sdk import astrasim_utils
+from aiconfigurator.sdk.astrasim_utils import AstraSimManager
 from aiconfigurator.sdk.common import PerfDataFilename
 from aiconfigurator.sdk.performance_result import PerformanceResult
 
-# Import AstraSim
-from aiconfigurator.sdk import astrasim_utils
-from aiconfigurator.sdk.astrasim_utils import AstraSimManager
-
-
-# Use centralized AstraSim imports
 NETWORK_SIM_AVAILABLE = astrasim_utils.NETWORK_SIM_AVAILABLE
-DEFAULT_NETWORK_CONFIG = astrasim_utils.DEFAULT_NETWORK_CONFIG
-
-
 
 databases_cache = defaultdict(lambda: defaultdict(lambda: defaultdict()))
 logger = logging.getLogger(__name__)
@@ -74,6 +67,16 @@ def set_systems_paths(raw_paths: str | Iterable[str] | None) -> None:
 
 def get_systems_paths() -> list[str]:
     return list(_SYSTEMS_PATHS)
+
+
+def get_system_config_path():
+    """
+    Return the built-in systems directory.
+
+    Legacy scripts use this single-path helper. New code should prefer
+    get_systems_paths() so custom systems directories can be layered in.
+    """
+    return pkg_resources.files("aiconfigurator") / "systems"
 
 
 def build_no_databases_message() -> str:
@@ -2206,24 +2209,20 @@ class PerfDatabase:
         backend: str,
         version: str,
         systems_root: str = "./systems",
+        *,
+        systems_dir: str | None = None,
         use_astrasim: bool = False,
         network_config: str | None = None,
     ) -> None:
         """
         Initialize the perf database
-
-        Args:
-            system: System name (e.g. 'h100_sxm')
-            backend: Backend name (e.g. 'trtllm', 'vllm', 'sglang')
-            version: Backend version string
-            systems_dir: Path to the systems directory
-            use_astrasim: When True, route NCCL / P2P / custom-allreduce /
-                AFD-P2P queries through AstraSim network simulation instead
-                of analytical SOL or silicon data.
-            network_config: Path to AstraSim network topology YAML file.
-                Defaults to ``DEFAULT_NETWORK_CONFIG`` when *use_astrasim*
-                is True and no explicit path is given.
         """
+        if systems_dir is not None:
+            if systems_root != "./systems" and os.fspath(systems_root) != os.fspath(systems_dir):
+                raise ValueError("Pass only one of systems_root or systems_dir, or pass the same path for both.")
+            systems_root = systems_dir
+        systems_root = os.fspath(systems_root)
+
         self.system = system
         self.backend = backend
         self.version = version
@@ -2235,17 +2234,12 @@ class PerfDatabase:
         # Cache for extracted metric data to avoid repeated extraction in _interp_3d
         self._extracted_metrics_cache = {}
 
-        # ------------------------------------------------------------------
-        # AstraSim network simulator configuration
-        # ------------------------------------------------------------------
         self._use_astrasim = use_astrasim and NETWORK_SIM_AVAILABLE
-        if use_astrasim:
-            self._astrasim = AstraSimManager(
-                system_spec=self.system_spec,
-                network_config=network_config,
-            )
-        else:
-            self._astrasim = None
+        self._astrasim = (
+            AstraSimManager(system_spec=self.system_spec, network_config=network_config)
+            if use_astrasim
+            else None
+        )
         if use_astrasim and not NETWORK_SIM_AVAILABLE:
             logger.warning(
                 "use_astrasim=True but AstraSim library is not available. "
@@ -3581,9 +3575,6 @@ class PerfDatabase:
 
         return current
 
-    # ------------------------------------------------------------------
-    # AstraSim network simulation helpers
-    # ------------------------------------------------------------------
     def _simulate_astrasim_collective(
         self,
         message_size_bytes: int,
@@ -3591,23 +3582,7 @@ class PerfDatabase:
         operation: str,
         gpu_ids: list[int] | None = None,
     ) -> float | None:
-        """Simulate a collective communication operation using AstraSim.
-
-        Delegates to the :class:`AstraSimManager` which handles topology
-        creation (with on-the-fly YAML generation and caching).  When a
-        ``system_spec`` is available the collective is automatically
-        routed through the correct network tiers.
-
-        Args:
-            message_size_bytes: Total message payload in **bytes**.
-            num_gpus: Number of GPUs participating in the collective.
-            operation: One of ``"all_reduce"``, ``"all_gather"``,
-                ``"reduce_scatter"``, ``"alltoall"``.
-            gpu_ids: Optional explicit GPU IDs for tiered simulation.
-
-        Returns:
-            Simulated latency in **milliseconds**, or ``None`` on failure.
-        """
+        """Delegate collective latency to AstraSim when enabled."""
         if self._astrasim is None:
             raise RuntimeError("_simulate_astrasim_collective called but AstraSim is not enabled")
         return self._astrasim.simulate_collective(message_size_bytes, num_gpus, operation, gpu_ids=gpu_ids)
@@ -3617,23 +3592,12 @@ class PerfDatabase:
         message_size_bytes: int,
         src_gpu: int,
         dst_gpu: int,
+        num_total_gpus: int | None = None,
     ) -> float | None:
-        """Simulate a point-to-point transfer using AstraSim.
-
-        Delegates to the :class:`AstraSimManager` which handles topology
-        creation (with on-the-fly YAML generation and caching).
-
-        Args:
-            message_size_bytes: Payload in bytes.
-            src_gpu: Source GPU ID.
-            dst_gpu: Destination GPU ID.
-
-        Returns:
-            Simulated latency in **milliseconds**, or ``None`` on failure.
-        """
+        """Delegate point-to-point latency to AstraSim when enabled."""
         if self._astrasim is None:
             raise RuntimeError("_simulate_astrasim_p2p called but AstraSim is not enabled")
-        return self._astrasim.simulate_p2p(message_size_bytes, src_gpu, dst_gpu)
+        return self._astrasim.simulate_p2p(message_size_bytes, src_gpu, dst_gpu, num_total_gpus=num_total_gpus)
 
     def _get_p2p_bandwidth(self, num_gpus: int) -> float:
         """
@@ -4490,8 +4454,8 @@ class PerfDatabase:
         if database_mode is None:
             database_mode = self._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
-            sol_time, sol_math, sol_mem = get_sol(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)
-            return PerformanceResult(sol_time, energy=0.0)
+            sol_latency = get_sol(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)[0]
+            return PerformanceResult(sol_latency, energy=0.0)
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
@@ -5005,12 +4969,7 @@ class PerfDatabase:
         if database_mode is None:
             database_mode = self._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
-            sol_time, sol_math, sol_mem = get_sol(b, s, prefix, tp_size, kvcache_quant_mode, fmha_quant_mode)
-            logger.debug(
-                f"wideep_context_mla sol: b={b} s={s} prefix={prefix} tp={tp_size}"
-                f"  compute={sol_math:.3f} ms  memory={sol_mem:.3f} ms"
-                f"  bound={'compute' if sol_math >= sol_mem else 'memory'}  sol={sol_time:.3f} ms"
-            )
+            sol_time = get_sol(b, s, prefix, tp_size, kvcache_quant_mode, fmha_quant_mode)[0]
             return PerformanceResult(sol_time, energy=0.0)
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(b, s, prefix, tp_size, kvcache_quant_mode, fmha_quant_mode)
@@ -5076,16 +5035,15 @@ class PerfDatabase:
         if tp_size == 1:
             return PerformanceResult(0.0, energy=0.0)
 
-        # ---- AstraSim path ----
         if self._use_astrasim:
-            # custom allreduce ≈ NCCL all_reduce; size is in element count, dtype = fp16 → ×2
-            message_bytes = size * 2  # fp16
+            message_bytes = int(size * common.CommQuantMode.half.value.memory)
             latency_ms = self._simulate_astrasim_collective(
-                message_bytes, num_gpus=tp_size, operation="all_reduce",
+                message_bytes,
+                num_gpus=tp_size,
+                operation="all_reduce",
             )
             if latency_ms is not None:
                 return PerformanceResult(latency_ms, energy=0.0)
-            # fallthrough to analytical on failure
 
         def get_sol(quant_mode: common.CommQuantMode, tp_size: int, size: int) -> tuple[float, float, float]:
             """
@@ -5215,15 +5173,15 @@ class PerfDatabase:
         if num_gpus == 1:
             return PerformanceResult(0.0, energy=0.0)
 
-        # ---- AstraSim path ----
         if self._use_astrasim:
             message_bytes = int(message_size * dtype.value.memory)
             latency_ms = self._simulate_astrasim_collective(
-                message_bytes, num_gpus=num_gpus, operation=operation,
+                message_bytes,
+                num_gpus=num_gpus,
+                operation=operation,
             )
             if latency_ms is not None:
                 return PerformanceResult(latency_ms, energy=0.0)
-            # fallthrough to analytical on failure
 
         def get_sol(
             dtype: common.CommQuantMode, num_gpus: int, operation: str, message_size: int
@@ -6115,14 +6073,14 @@ class PerfDatabase:
             PerformanceResult: Acts as float (latency in ms).
                               Energy accessible via .energy attribute (W·ms).
         """
-        # ---- AstraSim path ----
         if self._use_astrasim:
             latency_ms = self._simulate_astrasim_p2p(
-                message_size_bytes=message_bytes, src_gpu=0, dst_gpu=1,
+                message_size_bytes=message_bytes,
+                src_gpu=0,
+                dst_gpu=1,
             )
             if latency_ms is not None:
                 return PerformanceResult(latency_ms, energy=0.0)
-            # fallthrough to analytical on failure
 
         def get_sol(message_bytes: int) -> tuple[float, float, float]:
             """
@@ -6159,48 +6117,23 @@ class PerfDatabase:
         receiver_bytes: int,
         num_gpus: int = 0,
         database_mode: common.DatabaseMode | None = None,
+        *,
         num_attn_gpus: int = 0,
         num_ffn_gpus: int = 0,
         pre_dispatch: bool = True,
-    ) -> PerformanceResult:
-        """Query AFD (Attention-FFN Disaggregation) point-to-point communication latency.
+    ) -> PerformanceResult | tuple[float, float, float]:
+        """
+        Query AFD point-to-point communication latency.
 
-        Models the M-to-N P2P routing makespan between attention and FFN GPU groups.
-
-        When AstraSim is available **and** ``num_attn_gpus`` / ``num_ffn_gpus``
-        are provided, the transfers are decomposed into concrete
-        GPU-to-GPU P2P pairs and routed through the correct network
-        tiers (NVLink / IB) using the same :meth:`_simulate_tiered_transfers`
-        pipeline as KV-cache transfers.
-
-        Otherwise the analytical model is used:
-        ``max(t_send, t_recv) + startup_overhead`` with bandwidth
-        selected by the three-tier model in :meth:`_get_p2p_bandwidth`.
-
-        Args:
-            sender_bytes: Bytes each sender GPU pushes.
-            receiver_bytes: Bytes each receiver GPU pulls.
-            num_gpus: Total GPUs involved in the communication (for bandwidth
-                      tier selection).  If 0, falls back to ``inter_node_bw``.
-            database_mode: Optional database-mode override.
-            num_attn_gpus: Number of attention GPUs (for AstraSim tiered
-                simulation).  When 0, falls back to the legacy AstraSim
-                path or analytical model.
-            num_ffn_gpus: Number of FFN GPUs (for AstraSim tiered
-                simulation).
-            pre_dispatch: ``True`` for attn→FFN (dispatch), ``False``
-                for FFN→attn (combine).  Only used by the AstraSim path.
-
-        Returns:
-            PerformanceResult: Latency in ms.
+        Models the M-to-N routing makespan between attention and FFN GPU
+        groups. The analytical fallback is intentionally symmetric for dispatch
+        and combine: all senders and receivers are assumed to operate in
+        parallel, so latency is the slower of per-sender and per-receiver time.
         """
         if sender_bytes <= 0 and receiver_bytes <= 0:
             return PerformanceResult(0.0, energy=0.0)
 
-        # ---- AstraSim tiered path ----
-        if self._use_astrasim and num_attn_gpus > 0 and num_ffn_gpus > 0:
-            # Generate GPU IDs with the standard AFD layout:
-            # attn GPUs [0, M), FFN GPUs [M, M+N)
+        if self._use_astrasim and self._astrasim is not None and num_attn_gpus > 0 and num_ffn_gpus > 0:
             attn_ids = list(range(num_attn_gpus))
             ffn_ids = list(range(num_attn_gpus, num_attn_gpus + num_ffn_gpus))
             latency_ms = self._astrasim.simulate_afd_transfers(
@@ -6211,37 +6144,32 @@ class PerfDatabase:
                 pre_dispatch=pre_dispatch,
             )
             if latency_ms is not None:
-                # Add P2P routing setup overhead (10 us = 0.01 ms)
                 return PerformanceResult(latency_ms + 0.01, energy=0.0)
-            # fallthrough to analytical on failure
 
-        # Select bandwidth tier based on total GPU count
-        if num_gpus > 0:
-            bw = self._get_p2p_bandwidth(num_gpus)
-        else:
-            bw = self.system_spec["node"]["inter_node_bw"]
-
+        bw = self._get_p2p_bandwidth(num_gpus) if num_gpus > 0 else self.system_spec["node"]["inter_node_bw"]
         p2p_latency_s = self.system_spec["node"].get("p2p_latency", 0.0)
+
+        def get_sol() -> tuple[float, float, float]:
+            t_send = (sender_bytes / bw) * 1000 if sender_bytes > 0 else 0.0
+            t_recv = (receiver_bytes / bw) * 1000 if receiver_bytes > 0 else 0.0
+            sol_time = max(t_send, t_recv) + 0.01
+            return sol_time, 0.0, sol_time
+
+        def get_empirical() -> float:
+            t_send = (sender_bytes / bw + p2p_latency_s) * 1000 if sender_bytes > 0 else 0.0
+            t_recv = (receiver_bytes / bw + p2p_latency_s) * 1000 if receiver_bytes > 0 else 0.0
+            return max(t_send, t_recv) + 0.01
 
         if database_mode is None:
             database_mode = self._default_database_mode
-
         if database_mode == common.DatabaseMode.SOL:
-            t_send = (sender_bytes / bw) * 1000 if sender_bytes > 0 else 0.0
-            t_recv = (receiver_bytes / bw) * 1000 if receiver_bytes > 0 else 0.0
+            return PerformanceResult(get_sol()[0], energy=0.0)
+        elif database_mode == common.DatabaseMode.SOL_FULL:
+            return get_sol()
+        elif database_mode == common.DatabaseMode.EMPIRICAL:
+            return PerformanceResult(get_empirical(), energy=0.0)
         else:
-            # Empirical / silicon / hybrid: include startup latency per direction
-            t_send = (sender_bytes / bw + p2p_latency_s) * 1000 if sender_bytes > 0 else 0.0
-            t_recv = (receiver_bytes / bw + p2p_latency_s) * 1000 if receiver_bytes > 0 else 0.0
-
-        # Makespan: all senders and receivers operate in parallel;
-        # the step completes when the slowest participant finishes.
-        step_latency_ms = max(t_send, t_recv)
-
-        # P2P routing setup overhead (10 us = 0.01 ms)
-        step_latency_ms += 0.01
-
-        return PerformanceResult(step_latency_ms, energy=0.0)
+            return PerformanceResult(get_empirical(), energy=0.0)
 
     @functools.lru_cache(maxsize=32768)
     def query_wideep_deepep_ll(

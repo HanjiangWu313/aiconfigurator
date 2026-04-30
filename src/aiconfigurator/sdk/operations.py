@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+from typing import Optional
 
 from aiconfigurator.sdk import common
 from aiconfigurator.sdk.perf_database import PerfDatabase
@@ -141,10 +142,14 @@ class GEMM(Operation):
         self._quant_mode = quant_mode
         self._weights = self._n * self._k * quant_mode.value.memory
         self._scale_num_tokens = kwargs.get("scale_num_tokens", 1)
+        self._low_precision_input = kwargs.get("low_precision_input", False)
 
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         """
         Query GEMM latency with energy data.
+
+        For `fp8_static` quant mode, subtracts compute_scale overhead.
+        For GEMMs marked as low-precision input under `fp8_static`, also subtract scale_matrix.
 
         Returns:
             PerformanceResult: Behaves like float (scaled latency in ms).
@@ -155,19 +160,295 @@ class GEMM(Operation):
         x //= self._scale_num_tokens
         overwrite_quant_mode = kwargs.get("quant_mode")
         quant_mode = self._quant_mode if overwrite_quant_mode is None else overwrite_quant_mode
+        model_name = str(kwargs.get("model_name", ""))
+        is_fp8_static = quant_mode == common.GEMMQuantMode.fp8_static
 
         # Query with energy
         result = database.query_gemm(x, self._n, self._k, quant_mode)
+        latency = float(result)
+        energy = result.energy
 
-        # Return PerformanceResult: scale BOTH latency and energy
-        # (energy scales with latency for serial execution)
+        # Adjust for fp8_static: subtract compute_scale overhead, only fix for trtllm now
+        if is_fp8_static:
+            compute_scale_result = database.query_compute_scale(x, self._k, quant_mode)
+            latency -= float(compute_scale_result)
+            energy -= compute_scale_result.energy
+            if self._low_precision_input:
+                scale_matrix_result = database.query_scale_matrix(x, self._k, quant_mode)
+                latency -= float(scale_matrix_result)
+                energy -= scale_matrix_result.energy
+
+        # Ensure non-negative latency and energy
+        latency_clamped = max(0.0, latency)
+        energy_clamped = max(0.0, energy)
+        if latency_clamped != latency or energy_clamped != energy:
+            logger.warning(
+                "GEMM.query clamped latency/energy to 0.0. "
+                "op=%s model=%s m=%s n=%s k=%s quant_mode=%s post_sub(lat=%.6f, eng=%.6f)",
+                self._name,
+                model_name,
+                x,
+                self._n,
+                self._k,
+                quant_mode.name,
+                latency,
+                energy,
+            )
+
+        latency = latency_clamped
+        energy = energy_clamped
+
         return PerformanceResult(
-            latency=float(result) * self._scale_factor,  # Scaled latency
-            energy=result.energy * self._scale_factor,  # Scaled energy (proportional to latency)
+            latency=latency * self._scale_factor,
+            energy=energy * self._scale_factor,
         )
 
     def get_weights(self, **kwargs):
         return self._weights * self._scale_factor
+
+
+class TrtLLMWideEPMoE(Operation):
+    """
+    TensorRT-LLM WideEP MoE operation with configurable EPLB modes.
+
+    This class is specifically designed for TensorRT-LLM backend's WideEP MoE computation.
+    It handles the pure computation aspect of MoE, excluding All2All communication which
+    is handled by TrtLLMWideEPMoEDispatch.
+
+    Supports three EPLB modes:
+    - EPLB off: workload_distribution without "_eplb" suffix, num_slots = num_experts
+    - EPLB on: workload_distribution with "_eplb" suffix, num_slots = num_experts
+    - EPLB redundant: workload_distribution with "_eplb" suffix, num_slots > num_experts
+
+    Args:
+        name: Operation name
+        scale_factor: Scaling factor for the operation
+        hidden_size: Hidden dimension size
+        inter_size: Intermediate dimension size
+        topk: Number of top experts to select
+        num_experts: Total number of experts
+        num_slots: Number of expert slots (= num_experts for EPLB off/on, > num_experts for redundant)
+        moe_tp_size: MoE tensor parallelism size
+        moe_ep_size: MoE expert parallelism size
+        quant_mode: Quantization mode for MoE computation
+        workload_distribution: Workload distribution pattern (e.g., "power_law_1.01" or "power_law_1.01_eplb")
+        attention_dp_size: Attention data parallelism size (scales input tokens)
+        is_gated: Whether MoE uses gated activation (default: True)
+    """
+
+    def __init__(
+        self,
+        name: str,
+        scale_factor: float,
+        hidden_size: int,
+        inter_size: int,
+        topk: int,
+        num_experts: int,
+        moe_tp_size: int,
+        moe_ep_size: int,
+        quant_mode: common.MoEQuantMode,
+        workload_distribution: str,
+        attention_dp_size: int,
+        num_slots: Optional[int] = None,  # EPLB slots, defaults to num_experts
+        is_gated: bool = True,
+        **kwargs,
+    ) -> None:
+        super().__init__(name, scale_factor)
+        self._hidden_size = hidden_size
+        self._inter_size = inter_size
+        self._quant_mode = quant_mode
+        self._topk = topk
+        self._num_experts = num_experts
+        self._num_slots = num_slots if num_slots is not None else num_experts
+        self._moe_tp_size = moe_tp_size
+        self._moe_ep_size = moe_ep_size
+        self._attention_dp_size = attention_dp_size
+        self._workload_distribution = workload_distribution
+        self._is_gated = is_gated
+
+        # Calculate weights: 3 GEMMs for gated (gate, up, down), 2 GEMMs for non-gated (up, down)
+        num_gemms = 3 if is_gated else 2
+        self._weights = (
+            self._hidden_size
+            * self._inter_size
+            * self._num_experts
+            * quant_mode.value.memory
+            * num_gemms
+            // self._moe_ep_size
+            // self._moe_tp_size
+        )
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        """
+        Query TrtLLM WideEP MoE compute latency with energy data.
+
+        Supports three EPLB modes based on workload_distribution and num_slots:
+        - EPLB off: distribution without "_eplb" suffix, num_slots = num_experts
+        - EPLB on: distribution with "_eplb" suffix, num_slots = num_experts
+        - EPLB redundant: distribution with "_eplb" suffix, num_slots > num_experts
+
+        Args:
+            database: Performance database instance
+            **kwargs: Additional arguments including:
+                - x: Number of input tokens (will be scaled by attention_dp_size)
+                - quant_mode: Optional override for quantization mode
+
+        Returns:
+            PerformanceResult with latency and energy data
+        """
+        # Scale input tokens by attention_dp_size
+        x = kwargs.get("x") * self._attention_dp_size
+        overwrite_quant_mode = kwargs.get("quant_mode")
+        quant_mode = self._quant_mode if overwrite_quant_mode is None else overwrite_quant_mode
+
+        logger.debug(f"TrtLLMWideEPMoE: Querying compute with num_slots={self._num_slots}")
+
+        # Query WideEP MoE compute performance
+        result = database.query_wideep_moe_compute(
+            num_tokens=x,
+            hidden_size=self._hidden_size,
+            inter_size=self._inter_size,
+            topk=self._topk,
+            num_experts=self._num_experts,
+            num_slots=self._num_slots,
+            moe_tp_size=self._moe_tp_size,
+            moe_ep_size=self._moe_ep_size,
+            quant_mode=quant_mode,
+            workload_distribution=self._workload_distribution,
+        )
+
+        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
+
+    def get_weights(self, **kwargs):
+        """Get the weight memory size for this MoE layer."""
+        return self._weights * self._scale_factor
+
+
+class TrtLLMWideEPMoEDispatch(Operation):
+    """
+    TensorRT-LLM WideEP MoE dispatch operation using NVLink Two-Sided All2All.
+
+    This class handles WideEP-specific All2All communication for expert parallelism
+    in TensorRT-LLM, including prepare, dispatch, and combine phases.
+
+    Communication phases:
+    - Pre-dispatch: prepare + dispatch operations
+    - Post-dispatch: combine or combine_low_precision operation
+
+    Args:
+        name: Operation name
+        scale_factor: Scaling factor for the operation
+        hidden_size: Hidden dimension size
+        topk: Number of top experts to select
+        num_experts: Total number of experts
+        moe_tp_size: MoE tensor parallelism size
+        moe_ep_size: MoE expert parallelism size
+        attention_dp_size: Attention data parallelism size
+        pre_dispatch: If True, performs prepare+dispatch; if False, performs combine
+        quant_mode: Quantization mode for All2All operations (required)
+        use_low_precision_combine: If True, uses FP8 optimized combine (default: False)
+        node_num: Explicit node count for All2All; None means auto-compute from EP size
+    """
+
+    def __init__(
+        self,
+        name: str,
+        scale_factor: float,
+        hidden_size: int,
+        topk: int,
+        num_experts: int,
+        moe_tp_size: int,
+        moe_ep_size: int,
+        attention_dp_size: int,
+        pre_dispatch: bool,
+        quant_mode: common.MoEQuantMode,
+        use_low_precision_combine: bool = False,
+        node_num: Optional[int] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(name, scale_factor)
+        self._hidden_size = hidden_size
+        self._topk = topk
+        self._num_experts = num_experts
+        self._moe_tp_size = moe_tp_size
+        self._moe_ep_size = moe_ep_size
+        self._attention_dp_size = attention_dp_size
+        self._pre_dispatch = pre_dispatch
+        self._quant_mode = quant_mode
+        self._use_low_precision_combine = use_low_precision_combine
+        self._node_num = node_num
+        self._weights = 0.0  # MoEDispatch has no weight memory
+        self.num_gpus = self._moe_ep_size * self._moe_tp_size
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        """
+        Query TrtLLM WideEP All2All communication latency.
+
+        Args:
+            database: Performance database instance
+            **kwargs: Additional arguments including:
+                - x: Number of input tokens
+
+        Returns:
+            PerformanceResult with latency (no energy for communication ops)
+        """
+        num_tokens = kwargs.get("x")
+
+        phase = "Pre-dispatch" if self._pre_dispatch else "Post-dispatch"
+        precision = (
+            "low-precision combine"
+            if self._use_low_precision_combine and not self._pre_dispatch
+            else "standard precision"
+        )
+        logger.debug(f"TrtLLMWideEPMoEDispatch: {phase} with {precision}")
+
+        comm_latency = 0.0
+
+        if self._pre_dispatch:
+            prepare_result = database.query_trtllm_alltoall(
+                op_name="alltoall_prepare",
+                num_tokens=num_tokens,
+                hidden_size=self._hidden_size,
+                topk=self._topk,
+                num_experts=self._num_experts,
+                moe_ep_size=self._moe_ep_size,
+                quant_mode=self._quant_mode,
+                moe_backend="wideep",
+                node_num=self._node_num,
+            )
+            dispatch_result = database.query_trtllm_alltoall(
+                op_name="alltoall_dispatch",
+                num_tokens=num_tokens,
+                hidden_size=self._hidden_size,
+                topk=self._topk,
+                num_experts=self._num_experts,
+                moe_ep_size=self._moe_ep_size,
+                quant_mode=self._quant_mode,
+                moe_backend="wideep",
+                node_num=self._node_num,
+            )
+            comm_latency = float(prepare_result) + float(dispatch_result)
+        else:
+            combine_op = "alltoall_combine_low_precision" if self._use_low_precision_combine else "alltoall_combine"
+            combine_result = database.query_trtllm_alltoall(
+                op_name=combine_op,
+                num_tokens=num_tokens,
+                hidden_size=self._hidden_size,
+                topk=self._topk,
+                num_experts=self._num_experts,
+                moe_ep_size=self._moe_ep_size,
+                quant_mode=self._quant_mode,
+                moe_backend="wideep",
+                node_num=self._node_num,
+            )
+            comm_latency = float(combine_result)
+
+        # MoEDispatch returns no energy (communication ops don't track energy)
+        return PerformanceResult(comm_latency * self._scale_factor, energy=0.0)
+
+    def get_weights(self, **kwargs):
+        """MoE dispatch has no weight memory."""
+        return 0.0
 
 
 class MoE(Operation):
@@ -205,6 +486,7 @@ class MoE(Operation):
         self._is_context = is_context
         self._is_gated = is_gated
         self._moe_backend = kwargs.get("moe_backend")
+        self._enable_eplb = kwargs.get("enable_eplb", False)
         # 3 GEMMs for gated (gate, up, down), 2 GEMMs for non-gated (up, down)
         num_gemms = 3 if is_gated else 2
         self._weights = (
@@ -237,6 +519,7 @@ class MoE(Operation):
             is_context=self._is_context,
             moe_backend=self._moe_backend,
             is_gated=self._is_gated,
+            enable_eplb=self._enable_eplb,
         )
 
         return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
@@ -283,12 +566,14 @@ class MoEDispatch(Operation):
         self._moe_backend = kwargs.get("moe_backend")
         self._is_context = kwargs.get("is_context", True)
         self._scale_num_tokens = kwargs.get("scale_num_tokens", 1)
+        self._quant_mode = kwargs.get("quant_mode")
+        self._reduce_results = kwargs.get("reduce_results", True)
 
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         num_tokens = kwargs.get("x")
         volume = num_tokens * self._hidden_size
 
-        _sm_version = database.system_spec["gpu"]["sm_version"]
+        _sm_version = database.system_spec["gpu"].get("sm_version", -1)
         _num_gpus_per_node = database.system_spec["node"]["num_gpus_per_node"]
         _node_num = self.num_gpus / _num_gpus_per_node
 
@@ -344,99 +629,108 @@ class MoEDispatch(Operation):
             )
             return PerformanceResult(float(comm_latency) * self._scale_factor, energy=0.0)
 
+        if self._quant_mode is not None:
+            _quant_compress = self._quant_mode.value.memory / 2.0
+        else:
+            _quant_compress = 0.25
+
         if database.backend == common.BackendName.trtllm.value:
             assert self._attention_tp_size == 1 or self._attention_dp_size == 1, (
                 "trtllm does not support TP>1 and DP>1 for attn simultaneously"
             )
             if _sm_version == 100:
                 logger.debug("MoEDispatch: In trtllm SM100 execution path")
+
+                _alltoall_backends = {"CUTLASS", "TRTLLM"}
+                backend_supports_alltoall = self._moe_backend is None or self._moe_backend.upper() in _alltoall_backends
+                is_nvl72 = _num_gpus_per_node >= 72
+                enable_alltoall = (
+                    backend_supports_alltoall and self._attention_dp_size > 1 and self._moe_tp_size == 1 and is_nvl72
+                )
+
+                # Quantize-aware communication volume.
+                # When quant_mode is known, compute compressed volume:
+                #   nvfp4: volume/4 + scale_factor volume
+                #   fp8:   volume/2
+                #   others / unknown: full volume (BF16)
+                quant_mode = self._quant_mode
+                if quant_mode is not None and quant_mode == common.MoEQuantMode.nvfp4:
+                    dispatch_x_volume = volume / 4
+                    dispatch_sf_volume = volume / 4 / 8
+                elif quant_mode is not None and quant_mode in (common.MoEQuantMode.fp8, common.MoEQuantMode.fp8_block):
+                    dispatch_x_volume = volume / 2
+                    dispatch_sf_volume = 0
+                else:
+                    dispatch_x_volume = volume
+                    dispatch_sf_volume = 0
+
+                if enable_alltoall and quant_mode is None:
+                    raise ValueError("MoEDispatch requires quant_mode when TRTLLM alltoall path is enabled.")
+
                 if self._pre_dispatch:
-                    if self._attention_tp_size > 1:  # tp>1, use allreduce
-                        # to do: custom allreduce
-                        if _num_gpus_per_node == 72 and self.num_gpus > 4:  # to do: nvl72, node per gpu
-                            comm_latency = database.query_nccl(
-                                common.CommQuantMode.half, self.num_gpus, "all_reduce", volume
-                            )
-                        else:
-                            comm_latency = database.query_custom_allreduce(
-                                common.CommQuantMode.half, self.num_gpus, volume
-                            )
+                    if enable_alltoall:
+                        dispatch_result = database.query_trtllm_alltoall(
+                            op_name="alltoall_dispatch",
+                            num_tokens=num_tokens,
+                            hidden_size=self._hidden_size,
+                            topk=self._topk,
+                            num_experts=self._num_experts,
+                            moe_ep_size=self._moe_ep_size,
+                            quant_mode=quant_mode,
+                            moe_backend=self._moe_backend,
+                        )
+                        comm_latency = float(dispatch_result)
                     elif self._attention_dp_size > 1:
-                        if self._enable_fp4_all2all:
-                            # Calculate all2all communication volume for nvfp4 all2all operation
-                            # Volume calculation considers the average case between best and worst
-                            # scenarios:
-                            # - Best case: volume * 1/4 (all selected experts are in one GPU for
-                            #   all tokens)
-                            # - Worst case: volume * min(topk, attention_dp_size)/4 (every selected
-                            #   expert is in different GPU)
-                            # - Final volume: average of best and worst cases, divided by 4 for
-                            #   nvfp4 quantization
-                            all2all_volume = (
-                                volume * (1 + min(self._topk, self._attention_dp_size)) / 2 / 4
-                            )  # mean of best and worst
-                            # to do: nvfp4 custom all2all
-                            all2all_latency = database.query_nccl(
-                                common.CommQuantMode.half, self.num_gpus, "alltoall", all2all_volume
-                            )
-                            all2all_sf_latency = database.query_nccl(
-                                common.CommQuantMode.half,
-                                self.num_gpus,
-                                "alltoall",
-                                all2all_volume / 8,
-                            )  # volume_scale_factor = 1/8 volume
-                            comm_latency = all2all_latency + all2all_sf_latency + 1e-2  # msg size static latency 20us
+                        all_gather_volume = (dispatch_x_volume + dispatch_sf_volume) * self._attention_dp_size
+                        comm_latency = database.query_nccl(
+                            common.CommQuantMode.half, self.num_gpus, "all_gather", all_gather_volume
+                        )
+                    elif self._attention_tp_size > 1:
+                        if self._reduce_results:
+                            if _num_gpus_per_node == 72 and self.num_gpus > 4:
+                                comm_latency = database.query_nccl(
+                                    common.CommQuantMode.half, self.num_gpus, "all_reduce", volume
+                                )
+                            else:
+                                comm_latency = database.query_custom_allreduce(
+                                    common.CommQuantMode.half, self.num_gpus, volume
+                                )
                         else:
-                            all_gather_volume = volume * self._attention_dp_size / 4
-                            all_gather_latency = database.query_nccl(
-                                common.CommQuantMode.half,
-                                self.num_gpus,
-                                "all_gather",
-                                all_gather_volume,
-                            )  # nvfp4 allgather
-                            all_gather_sf_latency = database.query_nccl(
-                                common.CommQuantMode.half,
-                                self.num_gpus,
-                                "all_gather",
-                                all_gather_volume / 8,
-                            )  # volume_scale_factor = 1/8 volume
-                            comm_latency = all_gather_latency + all_gather_sf_latency
+                            comm_latency = 0
                     else:
                         comm_latency = 0
                 else:
-                    if self._attention_tp_size > 1:  # tp>1, use allreduce
-                        # to do: custom allreduce
-                        if _num_gpus_per_node == 72 and self.num_gpus > 4:  # to do: nvl72, node per gpu
-                            comm_latency = database.query_nccl(
-                                common.CommQuantMode.half, self.num_gpus, "all_reduce", volume
-                            )
-                        else:
-                            comm_latency = database.query_custom_allreduce(
-                                common.CommQuantMode.half, self.num_gpus, volume
-                            )
+                    if enable_alltoall:
+                        combine_result = database.query_trtllm_alltoall(
+                            op_name="alltoall_combine",
+                            num_tokens=num_tokens,
+                            hidden_size=self._hidden_size,
+                            topk=self._topk,
+                            num_experts=self._num_experts,
+                            moe_ep_size=self._moe_ep_size,
+                            quant_mode=quant_mode,
+                            moe_backend=self._moe_backend,
+                        )
+                        comm_latency = float(combine_result)
                     elif self._attention_dp_size > 1:
-                        if self._enable_fp4_all2all:
-                            # to do: nvfp4 all2all
-                            all2all_volume = (
-                                volume * (1 + min(self._topk, self._attention_dp_size)) / 2 / 4
-                            )  # nvfp4 all2all
-                            all2all_sf_latency = database.query_nccl(
-                                common.CommQuantMode.half,
-                                self.num_gpus,
-                                "alltoall",
-                                all2all_volume / 8,
-                            )  # volume_scale_factor = 1/8 volume
-                            comm_latency = database.query_nccl(
-                                common.CommQuantMode.half, self.num_gpus, "alltoall", all2all_volume
-                            ) + all2all_sf_latency + 1e-2  # msg size static latency 10us
+                        comm_latency = database.query_nccl(
+                            common.CommQuantMode.half,
+                            self.num_gpus,
+                            "reduce_scatter",
+                            volume * self._attention_dp_size,
+                        )
+                    elif self._attention_tp_size > 1:
+                        if self._reduce_results:
+                            if _num_gpus_per_node == 72 and self.num_gpus > 4:
+                                comm_latency = database.query_nccl(
+                                    common.CommQuantMode.half, self.num_gpus, "all_reduce", volume
+                                )
+                            else:
+                                comm_latency = database.query_custom_allreduce(
+                                    common.CommQuantMode.half, self.num_gpus, volume
+                                )
                         else:
-                            print("Post-dispatch Using NVFP4 ReduceScatter for MoE dispatch communication, ep_size:", self._moe_ep_size, "tp_size:", self._moe_tp_size, "attention_dp_size:", self._attention_dp_size)
-                            comm_latency = database.query_nccl(
-                                common.CommQuantMode.half,
-                                self.num_gpus,
-                                "reduce_scatter",
-                                volume * self._attention_dp_size,
-                            )
+                            comm_latency = 0
                     else:
                         comm_latency = 0
             else:  # sm < 100 or > 100 (for now)
@@ -613,7 +907,9 @@ class ContextAttention(Operation):
         fmha_quant_mode: common.FMHAQuantMode,
         window_size: int = 0,
         head_size: int = 128,
+        use_qk_norm: bool = False,
     ) -> None:
+        """Initialize context attention query parameters."""
         super().__init__(name, scale_factor)
         self._n = n
         self._weights = 0.0
@@ -622,6 +918,7 @@ class ContextAttention(Operation):
         self._fmha_quant_mode = fmha_quant_mode
         self._window_size = window_size
         self._head_size = head_size
+        self._use_qk_norm = use_qk_norm
 
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         """Query context attention latency with energy data."""
@@ -640,6 +937,25 @@ class ContextAttention(Operation):
             window_size=self._window_size,
             head_size=self._head_size,
         )
+        q_num = self._n * self._head_size
+        k_num = self._n_kv * self._head_size
+        v_num = self._n_kv * self._head_size
+        extra_latency = 0
+        if self._use_qk_norm:
+            qk_norm_latency = 2 * database.query_mem_op(q_num * 2) + 2 * database.query_mem_op(k_num * 2)
+            extra_latency += qk_norm_latency * 2  # elementwise before norm
+        apply_rope_latency = 2 * database.query_mem_op(q_num * 2 + k_num * 2)  # apply rope
+
+        kv_write_latency = database.query_mem_op(k_num * self._fmha_quant_mode.value.memory) + database.query_mem_op(
+            v_num * self._fmha_quant_mode.value.memory
+        )
+        extra_latency += apply_rope_latency + kv_write_latency
+        result += extra_latency * 1.1  # correction factor for extra latency
+
+        seq_imbalance_correction_scale = float(kwargs.get("seq_imbalance_correction_scale", 1.0))
+        if seq_imbalance_correction_scale != 1.0:
+            result = result * seq_imbalance_correction_scale
+
         return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
 
     def get_weights(self, **kwargs):
@@ -660,7 +976,9 @@ class GenerationAttention(Operation):
         kv_cache_dtype: common.KVCacheQuantMode,
         window_size: int = 0,
         head_size: int = 128,
+        use_qk_norm: bool = False,
     ) -> None:
+        """Initialize generation attention query parameters."""
         super().__init__(name, scale_factor)
         self._n = n
         self._weights = 0.0
@@ -668,11 +986,13 @@ class GenerationAttention(Operation):
         self._kv_cache_dtype = kv_cache_dtype
         self._window_size = window_size
         self._head_size = head_size
+        self._use_qk_norm = use_qk_norm
 
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         """Query generation attention latency with energy data."""
         beam_width = kwargs.get("beam_width")
-        assert beam_width == 1, "only support beam_width=1"
+        if beam_width != 1:
+            raise ValueError(f"{self.__class__.__name__} only supports beam_width=1, got {beam_width}")
         batch_size = kwargs.get("batch_size")
         s = kwargs.get("s")
 
@@ -685,6 +1005,16 @@ class GenerationAttention(Operation):
             window_size=self._window_size,
             head_size=self._head_size,
         )
+        # Generation/decoding stage uses a separate correction scale (do NOT reuse ctx scale).
+        # Backward-compatible fallback: if only the old key is provided, use it.
+        gen_seq_imbalance_correction_scale = float(
+            kwargs.get(
+                "gen_seq_imbalance_correction_scale",
+                kwargs.get("seq_imbalance_correction_scale", 1.0),
+            )
+        )
+        if gen_seq_imbalance_correction_scale != 1.0:
+            result = result * gen_seq_imbalance_correction_scale
         return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
 
     def get_weights(self, **kwargs):
@@ -707,7 +1037,7 @@ class ContextMLA(Operation):
         super().__init__(name, scale_factor)
         self._num_heads = num_heads
         # 2*(1536*24576/tp_size + 128/tp_size*512*128+128/tp_size*512*128)
-        # up q, up k, up v  float16 # 104MB / tpsize per layer
+        # up q, up k, up v  bfloat16 # 104MB / tpsize per layer
         self._weights = 0.0
         self._kvcache_quant_mode = kvcache_quant_mode
         self._fmha_quant_mode = fmha_quant_mode
@@ -747,14 +1077,15 @@ class GenerationMLA(Operation):
         super().__init__(name, scale_factor)
         self._num_heads = num_heads
         # 2*(1536*24576/tp_size + 128/tp_size*512*128+128/tp_size*512*128)
-        # up q, up k, v up float16
+        # up q, up k, v up bfloat16
         self._weights = 0.0
         self._kv_cache_dtype = kv_cache_dtype
 
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         """Query generation MLA latency with energy data."""
         beam_width = kwargs.get("beam_width")
-        assert beam_width == 1, "only support beam_width=1"
+        if beam_width != 1:
+            raise ValueError(f"{self.__class__.__name__} only supports beam_width=1, got {beam_width}")
         batch_size = kwargs.get("batch_size")
         s = kwargs.get("s")
 
@@ -788,7 +1119,8 @@ class MLABmm(Operation):
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         """Query MLA BMM latency with power data."""
         beam_width = kwargs.get("beam_width")
-        assert beam_width == 1, "only support beam_width=1"
+        if beam_width != 1:
+            raise ValueError(f"{self.__class__.__name__} only supports beam_width=1, got {beam_width}")
         batch_size = kwargs.get("batch_size")
 
         result = database.query_mla_bmm(batch_size, self._num_heads, self._quant_mode, self._if_pre)
@@ -858,7 +1190,7 @@ class ElementWise(Operation):
         """Query element-wise operation latency with power data."""
         x = kwargs.get("x")  # num tokens
         x //= self._scale_num_tokens
-        read_bytes = x * self._dim_in * 2  # fp16 for act
+        read_bytes = x * self._dim_in * 2  # bfloat16 for act
         write_bytes = x * self._dim_out * 2
 
         result = database.query_mem_op(read_bytes + write_bytes)
@@ -947,6 +1279,131 @@ class WideEPContextMLA(Operation):
             attention_backend=self._attn_backend,
         )
         return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
+
+    def get_weights(self, **kwargs):
+        return self._weights * self._scale_factor
+
+
+class Mamba2Kernel(Operation):
+    """
+    Single Mamba2 kernel op (Conv1D or SSM) using collected mamba2_perf data.
+
+    One of four kernels: causal_conv1d_fn, mamba_chunk_scan_combined (context),
+    causal_conv1d_update, selective_state_update (generation).
+    Uses full (unsharded) dimensions for lookup; collector data is per-layer.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        scale_factor: float,
+        kernel_source: str,
+        phase: str,
+        hidden_size: int,
+        nheads: int,
+        head_dim: int,
+        d_state: int,
+        d_conv: int,
+        n_groups: int,
+        chunk_size: int,
+    ) -> None:
+        super().__init__(name, scale_factor)
+        self._kernel_source = kernel_source
+        self._phase = phase
+        self._hidden_size = hidden_size
+        self._nheads = nheads
+        self._head_dim = head_dim
+        self._d_state = d_state
+        self._d_conv = d_conv
+        self._n_groups = n_groups
+        self._chunk_size = chunk_size
+        self._weights = 0.0
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        batch_size = kwargs.get("batch_size")
+        s = kwargs.get("s")
+        seq_len = s if self._phase == "context" else None
+        result = database.query_mamba2(
+            phase=self._phase,
+            kernel_source=self._kernel_source,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            d_model=self._hidden_size,
+            d_state=self._d_state,
+            d_conv=self._d_conv,
+            nheads=self._nheads,
+            head_dim=self._head_dim,
+            n_groups=self._n_groups,
+            chunk_size=self._chunk_size,
+        )
+        return PerformanceResult(
+            latency=float(result) * self._scale_factor,
+            energy=result.energy * self._scale_factor,
+        )
+
+    def get_weights(self, **kwargs):
+        return self._weights * self._scale_factor
+
+
+class GDNKernel(Operation):
+    """
+    Single Gated DeltaNet (GDN) kernel op for Qwen3.5 linear_attention layers.
+
+    Covers four kernel sources:
+      Context phase:
+        - "causal_conv1d_fn": Causal 1D convolution over full sequence
+        - "chunk_gated_delta_rule": GDN chunked scan (core recurrence)
+      Generation phase:
+        - "causal_conv1d_update": Single-step causal conv state update
+        - "fused_sigmoid_gating_delta_rule_update": Single-step GDN recurrence
+
+    Uses full (unsharded) dimensions for database lookup; collector data is per-layer.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        scale_factor: float,
+        kernel_source: str,
+        phase: str,
+        d_model: int,
+        num_k_heads: int,
+        head_k_dim: int,
+        num_v_heads: int,
+        head_v_dim: int,
+        d_conv: int,
+    ) -> None:
+        super().__init__(name, scale_factor)
+        self._kernel_source = kernel_source
+        self._phase = phase
+        self._d_model = d_model
+        self._num_k_heads = num_k_heads
+        self._head_k_dim = head_k_dim
+        self._num_v_heads = num_v_heads
+        self._head_v_dim = head_v_dim
+        self._d_conv = d_conv
+        self._weights = 0.0
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        batch_size = kwargs.get("batch_size")
+        s = kwargs.get("s")
+        seq_len = s if self._phase == "context" else None
+        result = database.query_gdn(
+            phase=self._phase,
+            kernel_source=self._kernel_source,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            d_model=self._d_model,
+            num_k_heads=self._num_k_heads,
+            head_k_dim=self._head_k_dim,
+            num_v_heads=self._num_v_heads,
+            head_v_dim=self._head_v_dim,
+            d_conv=self._d_conv,
+        )
+        return PerformanceResult(
+            latency=float(result) * self._scale_factor,
+            energy=result.energy * self._scale_factor,
+        )
 
     def get_weights(self, **kwargs):
         return self._weights * self._scale_factor
@@ -1055,7 +1512,7 @@ class Mamba2(Operation):
         # conv1d operates on xbc which has dimension conv_dim
         # Read: x * conv_dim * d_conv (for conv states) + x * conv_dim (input)
         # Write: x * conv_dim (output)
-        conv_read_bytes = x * conv_dim_per_gpu * (self._d_conv + 1) * 2  # fp16
+        conv_read_bytes = x * conv_dim_per_gpu * (self._d_conv + 1) * 2  # bfloat16
         conv_write_bytes = x * conv_dim_per_gpu * 2
         conv_result = database.query_mem_op(conv_read_bytes + conv_write_bytes)
         total_latency += float(conv_result)
@@ -1083,8 +1540,8 @@ class Mamba2(Operation):
 
         # 4. norm: RMSNormGated on d_inner (TRT-LLM mamba2_mixer.py line 315)
         # Read SSM output, apply norm with gating, write normalized output
-        norm_read_bytes = x * d_inner_per_gpu * 2  # fp16
-        norm_write_bytes = x * d_inner_per_gpu * 2  # fp16
+        norm_read_bytes = x * d_inner_per_gpu * 2  # bfloat16
+        norm_write_bytes = x * d_inner_per_gpu * 2  # bfloat16
         norm_result = database.query_mem_op(norm_read_bytes + norm_write_bytes)
         total_latency += float(norm_result)
         total_energy += norm_result.energy
@@ -1099,5 +1556,325 @@ class Mamba2(Operation):
             energy=total_energy * self._scale_factor,
         )
 
+    def get_weights(self, **kwargs):  # Mamba2 weights
+        return self._weights * self._scale_factor
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# DSA (DeepSeek Sparse Attention) Operations
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class ContextDSAModule(Operation):
+    """
+    Context phase DSA (DeepSeek Sparse Attention) module-level operation.
+
+    Models the full DSA attention block including:
+    - kv_a_proj_with_mqa GEMM (includes indexer K projection)
+    - LayerNorm + q_b_proj GEMM
+    - Indexer: wq_b GEMM, weights_proj GEMM, FP8 MQA logits, TopK selection
+    - Sparse MLA attention (attends to top-k tokens instead of full sequence)
+    - BMM pre/post (weight absorption + V projection)
+    - o_proj GEMM
+    """
+
+    def __init__(
+        self,
+        name: str,
+        scale_factor: float,
+        num_heads: int,
+        kvcache_quant_mode: common.KVCacheQuantMode,
+        fmha_quant_mode: common.FMHAQuantMode,
+        gemm_quant_mode: common.GEMMQuantMode,
+        architecture: str = "DeepseekV32ForCausalLM",
+    ) -> None:
+        super().__init__(name, scale_factor)
+        self._num_heads = num_heads
+        self._kvcache_quant_mode = kvcache_quant_mode
+        self._fmha_quant_mode = fmha_quant_mode
+        self._gemm_quant_mode = gemm_quant_mode
+        self._architecture = architecture
+        self._weights = 0.0
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        """Query context DSA latency with energy data."""
+        batch_size = kwargs.get("batch_size")
+        isl = kwargs.get("s")
+        prefix = kwargs.get("prefix", 0)
+
+        result = database.query_context_dsa_module(
+            b=batch_size,
+            s=isl,
+            prefix=prefix,
+            num_heads=self._num_heads,
+            kvcache_quant_mode=self._kvcache_quant_mode,
+            fmha_quant_mode=self._fmha_quant_mode,
+            gemm_quant_mode=self._gemm_quant_mode,
+            architecture=self._architecture,
+        )
+        return PerformanceResult(
+            float(result) * self._scale_factor,
+            energy=result.energy * self._scale_factor,
+        )
+
     def get_weights(self, **kwargs):
         return self._weights * self._scale_factor
+
+
+class GenerationDSAModule(Operation):
+    """
+    Generation phase DSA (DeepSeek Sparse Attention) module-level operation.
+
+    Models the full DSA attention block during decode:
+    - Same components as ContextDSAModule
+    - Uses paged MQA logits for indexer
+    - Sparse MLA with KV cache lookup
+    """
+
+    def __init__(
+        self,
+        name: str,
+        scale_factor: float,
+        num_heads: int,
+        kv_cache_dtype: common.KVCacheQuantMode,
+        gemm_quant_mode: common.GEMMQuantMode,
+        architecture: str = "DeepseekV32ForCausalLM",
+    ) -> None:
+        super().__init__(name, scale_factor)
+        self._num_heads = num_heads
+        self._kv_cache_dtype = kv_cache_dtype
+        self._gemm_quant_mode = gemm_quant_mode
+        self._architecture = architecture
+        self._weights = 0.0
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        """Query generation DSA latency with energy data."""
+        beam_width = kwargs.get("beam_width")
+        if beam_width != 1:
+            raise ValueError(f"{self.__class__.__name__} only supports beam_width=1, got {beam_width}")
+        batch_size = kwargs.get("batch_size")
+        s = kwargs.get("s")
+
+        result = database.query_generation_dsa_module(
+            b=batch_size,
+            s=s,
+            num_heads=self._num_heads,
+            kv_cache_dtype=self._kv_cache_dtype,
+            gemm_quant_mode=self._gemm_quant_mode,
+            architecture=self._architecture,
+        )
+        return PerformanceResult(
+            float(result) * self._scale_factor,
+            energy=result.energy * self._scale_factor,
+        )
+
+    def get_weights(self, **kwargs):
+        return self._weights * self._scale_factor
+
+
+class MLAModule(Operation):
+    """
+    Module-level MLA operation for both context and generation phases.
+
+    Models the complete MLA attention block as a single profiled operation.
+    For context: replaces q_b_proj + kv_b_proj + ContextMLA + proj.
+    For generation: replaces MLABmm(pre) + GenerationMLA + MLABmm(post).
+    """
+
+    def __init__(
+        self,
+        name: str,
+        scale_factor: float,
+        is_context: bool,
+        num_heads: int,
+        kvcache_quant_mode: common.KVCacheQuantMode,
+        fmha_quant_mode: common.FMHAQuantMode,
+        gemm_quant_mode: common.GEMMQuantMode,
+    ) -> None:
+        super().__init__(name, scale_factor)
+        self._is_context = is_context
+        self._num_heads = num_heads
+        self._kvcache_quant_mode = kvcache_quant_mode
+        self._fmha_quant_mode = fmha_quant_mode
+        self._gemm_quant_mode = gemm_quant_mode
+        self._weights = 0.0
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        """Query MLA module latency with energy data."""
+        batch_size = kwargs.get("batch_size")
+        s = kwargs.get("s")
+
+        if self._is_context:
+            prefix = kwargs.get("prefix", 0)
+            result = database.query_context_mla_module(
+                b=batch_size,
+                s=s,
+                prefix=prefix,
+                num_heads=self._num_heads,
+                kvcache_quant_mode=self._kvcache_quant_mode,
+                fmha_quant_mode=self._fmha_quant_mode,
+                gemm_quant_mode=self._gemm_quant_mode,
+            )
+        else:
+            beam_width = kwargs.get("beam_width")
+            if beam_width != 1:
+                raise ValueError(f"{self.__class__.__name__} only supports beam_width=1, got {beam_width}")
+            result = database.query_generation_mla_module(
+                b=batch_size,
+                s=s,
+                num_heads=self._num_heads,
+                kv_cache_dtype=self._kvcache_quant_mode,
+                fmha_quant_mode=self._fmha_quant_mode,
+                gemm_quant_mode=self._gemm_quant_mode,
+            )
+
+        return PerformanceResult(
+            float(result) * self._scale_factor,
+            energy=result.energy * self._scale_factor,
+        )
+
+    def get_weights(self, **kwargs):
+        return self._weights * self._scale_factor
+
+
+class FallbackOp(Operation):
+    """
+    Try a primary operation first; if it raises PerfDataNotAvailableError,
+    fall back to a sequence of fallback operations (summed).
+
+    This supports transitional periods where some systems have module-level
+    profiling data (single op) while others still have granular per-kernel data
+    (multiple ops). The fallback is symmetric: either group can be primary.
+
+    The primary is always queried in SILICON mode so that HYBRID does not
+    silently swallow a miss with an empirical estimate — the fallback ops
+    (which have real data) should be preferred over an empirical guess.
+
+    Once the primary fails on the first call, it is skipped on all subsequent
+    calls to avoid redundant work.
+
+    Latency = primary.query()  OR  sum(fallback[i].query())
+    Energy  = same source as whichever succeeds
+    Weights = sum of whichever group is used (primary or fallback)
+    """
+
+    def __init__(self, name: str, primary: Operation, fallback: list[Operation]) -> None:
+        """
+        Args:
+            name: Operation name for latency breakdown reporting.
+            primary: Single operation to try first.
+            fallback: List of operations to sum if primary fails.
+        """
+        super().__init__(name, 1.0)  # scale_factor handled by inner ops
+        self._primary = primary
+        self._fallback = fallback
+        self._primary_unavailable = False
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        import logging as _logging
+
+        from aiconfigurator.sdk.perf_database import PerfDataNotAvailableError
+
+        if not self._primary_unavailable:
+            # Force SILICON mode on the primary so that HYBRID doesn't silently
+            # return an empirical estimate when module data is missing.
+            prev_mode = database._default_database_mode
+            database._default_database_mode = common.DatabaseMode.SILICON
+
+            # Suppress ERROR-level logs from perf_database during the primary
+            # attempt, since a failure here is expected and handled by fallback.
+            perf_db_logger = _logging.getLogger("aiconfigurator.sdk.perf_database")
+            prev_log_level = perf_db_logger.level
+            perf_db_logger.setLevel(_logging.CRITICAL)
+            try:
+                return self._primary.query(database, **kwargs)
+            except (PerfDataNotAvailableError, KeyError, AssertionError) as e:
+                if isinstance(e, PerfDataNotAvailableError):
+                    self._primary_unavailable = True
+                logger.debug(
+                    "FallbackOp '%s': primary op '%s' failed (%s: %s), using fallback ops",
+                    self._name,
+                    self._primary._name,
+                    type(e).__name__,
+                    e,
+                )
+            finally:
+                database._default_database_mode = prev_mode
+                perf_db_logger.setLevel(prev_log_level)
+
+        total_latency = 0.0
+        total_energy = 0.0
+        for op in self._fallback:
+            result = op.query(database, **kwargs)
+            total_latency += float(result)
+            total_energy += getattr(result, "energy", 0.0)
+        return PerformanceResult(total_latency, energy=total_energy)
+
+    def get_weights(self, **kwargs):
+        # Use primary weights if available, otherwise sum fallback weights.
+        # In practice both should be equivalent since they model the same block.
+        if not self._primary_unavailable:
+            primary_w = self._primary.get_weights(**kwargs)
+            if primary_w > 0:
+                return primary_w
+        return sum(op.get_weights(**kwargs) for op in self._fallback)
+
+
+class OverlapOp(Operation):
+    """
+    Two groups of operations that execute in parallel (overlap).
+
+    This models the TRT-LLM `maybe_execute_in_parallel` behavior where two
+    operation groups run concurrently on different CUDA streams during
+    generation phase (CUDA Graph enabled).
+
+    Latency = max(sum(group_a latencies), sum(group_b latencies))
+    Energy  = sum(all ops in both groups)  # both groups consume power
+    Weights = sum(all ops in both groups)
+    """
+
+    def __init__(self, name: str, group_a: list, group_b: list) -> None:
+        """
+        Args:
+            name: Operation name for latency breakdown reporting.
+            group_a: List of Operation objects for the first parallel group
+                     (e.g., routed expert path on main stream).
+            group_b: List of Operation objects for the second parallel group
+                     (e.g., shared expert path on aux stream).
+        """
+        super().__init__(name, 1.0)  # scale_factor handled by inner ops
+        self._group_a = group_a
+        self._group_b = group_b
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        """
+        Query overlap operation latency.
+
+        Returns:
+            PerformanceResult with latency = max(group_a, group_b)
+            and energy = sum of all ops.
+        """
+        latency_a = 0.0
+        energy_a = 0.0
+        for op in self._group_a:
+            result = op.query(database, **kwargs)
+            latency_a += float(result)
+            energy_a += getattr(result, "energy", 0.0)
+
+        latency_b = 0.0
+        energy_b = 0.0
+        for op in self._group_b:
+            result = op.query(database, **kwargs)
+            latency_b += float(result)
+            energy_b += getattr(result, "energy", 0.0)
+
+        return PerformanceResult(
+            latency=max(latency_a, latency_b),
+            energy=energy_a + energy_b,
+        )
+
+    def get_weights(self, **kwargs):
+        weights = 0.0
+        for op in self._group_a + self._group_b:
+            weights += op.get_weights(**kwargs)
+        return weights
