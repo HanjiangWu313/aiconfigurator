@@ -1472,9 +1472,12 @@ class DisaggInferenceSession:
                         category_results.append(disagg_dict)
 
                 if category_results:
-                    # only return the best one for each category
-                    best_result = max(category_results, key=lambda x: (x["tokens/s/gpu"], -x["num_total_gpus"]))
-                    all_category_results.append(best_result)
+                    # keep top-N per category instead of just the best, so the Pareto plot has
+                    # multiple operating points per (d)parallel shape (different replica sizes,
+                    # batch sizes, prefill shapes) instead of a single point.
+                    PER_CATEGORY_TOP_N = 5
+                    category_results.sort(key=lambda x: (-x["tokens/s/gpu"], x["num_total_gpus"]))
+                    all_category_results.extend(category_results[:PER_CATEGORY_TOP_N])
                 else:
                     logger.debug(f"No matched result for decode parallel {parallel_value}.")
 
@@ -1576,7 +1579,7 @@ class DisaggInferenceSession:
                 tpot=tpot_constraint,
                 prefill_summary_df=prefill_summary_df,
                 decode_summary_df=decode_summary_df,
-                return_top_k=5,
+                return_top_k=30,
                 num_gpu_list=num_gpu_list,
                 rate_matching_prefill_degradation_factor=self._rate_matching_prefill_degradation_factor,
                 rate_matching_decode_degradation_factor=self._rate_matching_decode_degradation_factor,
