@@ -642,48 +642,99 @@ class SGLANGBackend(BaseBackend):
         In AFD mode, attention GPUs and FFN GPUs are physically separate groups.
         Attention GPUs hold attention weights + KV cache; FFN GPUs hold MoE/FFN weights.
         The returned dict reports memory for both groups and the bottleneck (max).
-        """
-        # Delegate to TRTLLM implementation with sglang-specific overheads applied
-        from aiconfigurator.sdk.backends.trtllm_backend import TRTLLMBackend
 
-        base_result = TRTLLMBackend()._get_afd_memory_usage(
-            model, database, batch_size, beam_width, isl, osl, num_tokens
+        """
+        # --- Weights split: attn ops vs FFN ops ---
+        attn_weights = 0.0
+        ffn_weights = 0.0
+        for op in model.context_ops:
+            w = op.get_weights()
+            if model._is_attn_op(op._name):
+                attn_weights += w
+            else:
+                ffn_weights += w
+
+        # Pipeline stages share weights across stages
+        attn_weights /= model.config.pp_size
+        ffn_weights /= model.config.pp_size
+
+        h = model._num_heads * model._head_size
+        if num_tokens == 0:
+            num_tokens = isl * batch_size
+
+        # --- Activations split (SGLANG coefficients) ---
+        # Totals match SGLANG non-AFD c_dicts; split proportions follow TRTLLM AFD.
+        if model.model_family in ("MOE", "DEEPSEEK", "DEEPSEEKV32"):
+            attn_c_dict = {1: 7.5, 2: 5, 4: 4, 8: 4}
+            ffn_c_dict = {1: 20.5, 2: 12, 4: 9, 8: 9}
+        elif model.model_family == "LLAMA":
+            attn_c_dict = {1: 6.5, 2: 4, 4: 3.25, 8: 3.25}
+            ffn_c_dict = {1: 7.5, 2: 4.5, 4: 3.25, 8: 3.25}
+        elif model.model_family == "GPT":
+            attn_c_dict = {1: 6.5, 2: 4, 4: 3.25, 8: 3.25}
+            ffn_c_dict = {1: 6.5, 2: 4, 4: 3.25, 8: 3.25}
+        else:
+            attn_c_dict = {1: 6.5, 2: 4, 4: 3.25, 8: 3.25}
+            ffn_c_dict = {1: 6.5, 2: 4, 4: 3.25, 8: 3.25}
+
+        tp = min(model.config.tp_size, 8)
+        attn_activations = 2 * num_tokens * h * attn_c_dict[tp]
+        ffn_activations = 2 * num_tokens * h * ffn_c_dict[tp]
+
+        # DeepSeek MoE workspace (block scale, fp32)
+        if model.model_family in ("DEEPSEEK", "DEEPSEEKV32"):
+            ffn_activations += (
+                num_tokens
+                * h
+                * model.config.attention_dp_size
+                * getattr(model, '_num_experts', 1)
+                * getattr(model, '_topk', 1)
+                / model.config.moe_ep_size
+                / 128
+                * 4
+            )
+
+        # SGLANG floor (90 MiB) — higher than TRTLLM's 70 MiB
+        attn_activations = max(attn_activations, 90 * 1024 * 1024)
+        ffn_activations = max(ffn_activations, 90 * 1024 * 1024)
+
+        # MTP correction applies to all model families in SGLANG (matches non-AFD path)
+        if model.config.nextn > 0:
+            attn_activations *= (model.config.nextn + 1)
+            ffn_activations *= (model.config.nextn + 1)
+
+        # SGLANG +15% activation overhead (Python/dynamic execution)
+        attn_activations *= 1.15
+        ffn_activations *= 1.15
+
+        # --- KV cache: only on attention GPUs ---
+        per_rank_kvcache_bytes = self.get_kv_cache_size_bytes_per_rank(
+            model=model,
+            batch_size=batch_size,
+            isl=isl,
+            beam_width=beam_width,
+            osl=osl,
         )
 
-        # Apply SGLANG-specific overhead factors (matching _get_memory_usage ratios)
-        sglang_act_overhead = 1.15  # 15% higher activations
-        sglang_sys_overhead = 1.20  # 20% higher system overhead
+        # --- NCCL + system memory: present on both groups ---
+        nccl_mem = database.system_spec["misc"]["nccl_mem"][min(model.config.tp_size, 8)]
+        others_mem = database.system_spec["misc"]["other_mem"] * 1.20  # SGLANG +20% system overhead
 
         one_gib = 1 << 30
-        attn_act_adjusted = base_result["attn_activations"] * sglang_act_overhead
-        ffn_act_adjusted = base_result["ffn_activations"] * sglang_act_overhead
-        others_adjusted = base_result["others"] * sglang_sys_overhead
-
-        attn_total = (
-            base_result["attn_weights"]
-            + attn_act_adjusted
-            + base_result["kvcache"]
-            + base_result["nccl"]
-            + others_adjusted
-        )
-        ffn_total = (
-            base_result["ffn_weights"]
-            + ffn_act_adjusted
-            + base_result["nccl"]
-            + others_adjusted
-        )
+        attn_total = (attn_weights + attn_activations + per_rank_kvcache_bytes + nccl_mem + others_mem) / one_gib
+        ffn_total = (ffn_weights + ffn_activations + nccl_mem + others_mem) / one_gib
         bottleneck = max(attn_total, ffn_total)
 
         return {
             "total": bottleneck,
             "attn_total": attn_total,
             "ffn_total": ffn_total,
-            "attn_weights": base_result["attn_weights"],
-            "ffn_weights": base_result["ffn_weights"],
-            "attn_activations": attn_act_adjusted,
-            "ffn_activations": ffn_act_adjusted,
-            "kvcache": base_result["kvcache"],
-            "nccl": base_result["nccl"],
-            "others": others_adjusted,
+            "attn_weights": attn_weights / one_gib,
+            "ffn_weights": ffn_weights / one_gib,
+            "attn_activations": attn_activations / one_gib,
+            "ffn_activations": ffn_activations / one_gib,
+            "kvcache": per_rank_kvcache_bytes / one_gib,
+            "nccl": nccl_mem / one_gib,
+            "others": others_mem / one_gib,
             "bottleneck_group": "attn" if attn_total >= ffn_total else "ffn",
         }

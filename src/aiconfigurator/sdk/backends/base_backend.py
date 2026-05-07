@@ -412,6 +412,26 @@ class BaseBackend(ABC):
             # Cap M so each microbatch has at least 1 sequence; if batch_size < requested M,
             # reduce M to batch_size (degenerate M=1 → equivalent to non-pipelined).
             M = max(min(num_microbatches, batch_size), 1)
+            if M == 1:
+                if _afd_heterogeneous:
+                    sequential_lat = defaultdict(float)
+                    sequential_energy = defaultdict(float)
+                    for stage_ops, stage_db in (
+                        (_afd_attn_model.generation_attn_compute_ops, _afd_attn_db),
+                        (_afd_attn_model.generation_comm_a2f_ops, _afd_attn_db),
+                        (_afd_ffn_model.generation_ffn_compute_ops, _afd_ffn_db),
+                        (_afd_ffn_model.generation_comm_f2a_ops, _afd_ffn_db),
+                    ):
+                        stage_lat, stage_energy = _run_generation(
+                            batch_size, beam_width, isl, osl, stride, ops=stage_ops, db=stage_db
+                        )
+                        for op_name, latency_ms in stage_lat.items():
+                            sequential_lat[op_name] += latency_ms
+                            sequential_energy[op_name] += stage_energy.get(op_name, 0.0)
+                    return sequential_lat, sequential_energy
+
+                return _run_generation(batch_size, beam_width, isl, osl, stride)
+
             L = getattr(_afd_attn_model, "_num_layers", None) or getattr(model, "_num_layers", 1)
             mb_bs = max(batch_size // M, 1)
             s1_lat, s1_energy = _run_generation(
@@ -563,7 +583,6 @@ class BaseBackend(ABC):
                 return self._get_afd_memory_usage(model, database, bs, bw, _isl, _osl, _num_tokens)
             return self._get_memory_usage(model, database, bs, bw, _isl, _osl, _num_tokens)
 
-        # --- Resolve per-group ops source model and database for AFD sub-modes ---
         # For heterogeneous AFD, attn sub-modes use _afd_attn_model ops queried
         # against _afd_attn_db, and ffn sub-modes use _afd_ffn_model / _afd_ffn_db.
         _afd_ctx_ops_db = {

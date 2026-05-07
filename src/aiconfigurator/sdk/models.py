@@ -4038,6 +4038,30 @@ class NemotronHModel(BaseModel):
         super().__init__(*args)
         assert self._nextn == 0, "NemotronH does not support mtp"
 
+        # Parallel-width guard: skipped under AFD because attention and FFN run on
+        # decoupled GPU groups (mirrors MOEModel / DeepSeekModel).
+        if not self.config.enable_afd:
+            assert (
+                self.config.tp_size * self.config.attention_dp_size
+                == self.config.moe_tp_size * self.config.moe_ep_size
+            ), (
+                f"tp_size ({self.config.tp_size}) * attention_dp_size "
+                f"({self.config.attention_dp_size}) should be equal to moe_tp_size "
+                f"({self.config.moe_tp_size}) * moe_ep_size ({self.config.moe_ep_size})"
+            )
+
+        # Auto-derive num_attn_gpus / num_ffn_gpus when AFD is enabled but the
+        # caller has not set them explicitly. Same block as in MOEModel / DeepSeekModel.
+        if self.config.enable_afd:
+            if self.config.num_attn_gpus is None:
+                self.config.num_attn_gpus = self.config.tp_size * self.config.attention_dp_size
+            if self.config.num_ffn_gpus is None:
+                self.config.num_ffn_gpus = self.config.moe_tp_size * self.config.moe_ep_size
+
+        assert num_experts >= self.config.moe_ep_size, (
+            f"ep size cannot be larger than num_experts {num_experts}"
+        )
+
         self._topk = topk
         self._num_experts = num_experts
         self._moe_inter_size = moe_inter_size
