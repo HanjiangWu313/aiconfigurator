@@ -18,6 +18,24 @@ venv/
 env/
 .venv/
 
+# Machine-local environments and experiment outputs
+/aiconfigvenv/
+/artifacts/
+/logs/
+/outputs/
+/.codex
+
+# Generated study artifacts written at the repository root
+/*.csv
+/*.html
+/*.pdf
+/*.png
+
+# Generated tool outputs
+/tools/data/model_runtime_breakdown.csv
+/tools/kv_transfer_placement_study.csv
+/tools/kv_transfer_placement_study.pdf
+
 *.pyc
 *.pyo
 *.pyd

@@ -136,3 +136,38 @@ def test_run_static_latency_only_matches_run_static_latency(
 
     assert latency_only == pytest.approx(summary_latency)
     assert latency_only == pytest.approx(request_latency, abs=1e-3)
+
+
+def test_afd_decode_batch_one_falls_back_to_non_pipelined_generation(
+    backend: BaseBackend,
+    model,
+    database,
+) -> None:
+    gen_attn = _StaticOp("generation_attention", latency_ms=20.0, energy_wms=200.0)
+    gen_a2f = _StaticOp("generation_moe_pre_dispatch", latency_ms=10.0, energy_wms=100.0)
+    gen_ffn = _StaticOp("generation_moe", latency_ms=5.0, energy_wms=50.0)
+    gen_f2a = _StaticOp("generation_moe_post_dispatch", latency_ms=5.0, energy_wms=50.0)
+
+    model.generation_ops = [gen_attn, gen_a2f, gen_ffn, gen_f2a]
+    model.generation_attn_compute_ops = [gen_attn]
+    model.generation_comm_a2f_ops = [gen_a2f]
+    model.generation_ffn_compute_ops = [gen_ffn]
+    model.generation_comm_f2a_ops = [gen_f2a]
+    model._num_layers = 10
+    model.config.enable_afd = True
+    model.config.num_attn_gpus = 1
+    model.config.num_ffn_gpus = 1
+    model.config.afd_num_microbatches = 4
+
+    runtime_config = RuntimeConfig(batch_size=1, beam_width=1, isl=8, osl=2, prefix=0)
+
+    summary = backend.run_static(
+        model,
+        database,
+        runtime_config,
+        mode="static_gen",
+        stride=1,
+    )
+
+    assert sum(summary.get_generation_latency_dict().values()) == pytest.approx(40.0)
+    assert sum(summary.get_generation_energy_wms_dict().values()) == pytest.approx(400.0)

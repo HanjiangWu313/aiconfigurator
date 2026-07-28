@@ -559,7 +559,7 @@ def _execute_task_configs(
     for exp_name, task_config in list(task_configs.items()):
         try:
             logger.info("Starting experiment: %s", exp_name)
-            logger.info("Task config: %s", task_config.pretty())
+            logger.info("Task config:\n%s", task_config.to_yaml())
             task_result = runner.run(task_config)
             pareto_df = task_result["pareto_df"]
             if pareto_df is not None and not pareto_df.empty:

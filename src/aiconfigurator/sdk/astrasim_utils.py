@@ -1212,8 +1212,39 @@ class AstraSimManager:
         tier_name: str,
         group: list[tuple[int, int, int]],
     ) -> tuple[list[tuple[int, int, int]], int, dict[int, int]]:
-        """Prepare group for topology simulation using raw IDs.
+        """Map global NIC endpoints to a compact topology when appropriate.
+
+        Inter-node and inter-rack groups use GPU IDs as global NIC endpoint
+        identities. Their Switch topology only needs the participating
+        endpoints, so remapping them densely preserves endpoint contention
+        while avoiding a topology sized by the largest global GPU ID.
+
+        Other tiers already use topology-local IDs. Keeping those IDs intact
+        preserves their positional meaning, especially for flat Ring
+        topologies.
         """
+        if tier_name in {"inter-node", "inter-rack"}:
+            participants = sorted(
+                {
+                    participant_id
+                    for src_id, dst_id, _ in group
+                    for participant_id in (src_id, dst_id)
+                }
+            )
+            participant_to_local = {
+                participant_id: local_id
+                for local_id, participant_id in enumerate(participants)
+            }
+            remapped_group = [
+                (
+                    participant_to_local[src_id],
+                    participant_to_local[dst_id],
+                    size_bytes,
+                )
+                for src_id, dst_id, size_bytes in group
+            ]
+            return remapped_group, len(participants), participant_to_local
+
         max_local_id = max(max(src_id, dst_id) for src_id, dst_id, _ in group)
         participant_to_local = {
             participant_id: participant_id
