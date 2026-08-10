@@ -443,6 +443,9 @@ class AstraSimManager:
     * *network_config* – explicit path to a static AstraSim YAML file.
       When given, this file is used directly (no auto-generation).
     * *topology_type* – default topology when auto-generating.
+    * *tier_topology_override* – force a topology (e.g. ``"Ring"``) on the
+      **tiered** KV-cache path, which otherwise always uses ``Switch``.
+      ``None`` (default) preserves the per-tier auto-selection.
     * *cache_dir* – directory for auto-generated YAML files.
 
     If neither *system_spec* nor *network_config* is provided, the
@@ -454,11 +457,16 @@ class AstraSimManager:
         system_spec: dict | None = None,
         network_config: str | None = None,
         topology_type: str = "Ring",
+        tier_topology_override: str | None = None,
         cache_dir: str | None = None,
     ) -> None:
         self._system_spec = system_spec
         self._explicit_config = network_config
         self._default_topology_type = topology_type
+        # Kept separate from _default_topology_type: that field defaults to
+        # "Ring" and drives the single-tier path, so reusing it here would
+        # silently flip every tiered result from Switch to Ring.
+        self._tier_topology_override = tier_topology_override
         self._cache_dir = cache_dir or _DEFAULT_TOPOLOGY_CACHE_DIR
         self._enabled = NETWORK_SIM_AVAILABLE
 
@@ -1087,6 +1095,11 @@ class AstraSimManager:
 
         if lat < 1.0:
             lat = 500.0
+
+        # Explicit override wins over the per-tier auto-selection above.
+        # Used by interconnect sensitivity studies (Switch vs Ring).
+        if self._tier_topology_override is not None:
+            topo = self._tier_topology_override
 
         return {
             "npus_count": num_units,

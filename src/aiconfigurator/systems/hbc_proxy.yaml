@@ -1,0 +1,101 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# ---------------------------------------------------------------------------
+# HBC (High Bandwidth Compute) -- ANALYTICAL PROXY SYSTEM
+# ---------------------------------------------------------------------------
+# Near-memory / processing-in-memory architecture. Compute logic is embedded
+# INSIDE the memory stack, so data-intensive operations execute where the data
+# lives and "only compact results leave the stack".
+#
+#   Source: Qualcomm, "HBC vs. HBM vs. SRAM: AI inference memory" (2026-07)
+#   NOTE: HBC = High Bandwidth *Compute*, not "cache".
+#
+# The defining property is TWO bandwidths on one device:
+#   * internal (in-stack)  -- very high, feeds near-memory compute units
+#   * external (interface) -- modest, carries only results out
+# with "an internal-to-external ratio measured in multiples".
+#
+# USE WITH --database-mode SOL.
+#
+# ---------------------------------------------------------------------------
+# PHASE 1 LIMITATION -- READ BEFORE QUOTING ANY NUMBER FROM THIS FILE
+# ---------------------------------------------------------------------------
+# The SDK models device memory as a SINGLE scalar (`gpu.mem_bw`), applied to
+# every operator. This file therefore sets mem_bw to the INTERNAL bandwidth,
+# which means every op on this device -- including ones that must actually ship
+# their full output across the interface -- is costed at in-stack speed.
+#
+# That makes Phase 1 an OPTIMISTIC UPPER BOUND, not a model. It will show HBC
+# winning essentially everything. `mem_bw_external` and `near_memory_ops` below
+# are declared but INERT until the Phase 2 dual-bandwidth accessor lands in
+# perf_database.py; they are written here so the schema is stable across phases.
+#
+# ---------------------------------------------------------------------------
+# ASSUMPTIONS -- Qualcomm published RATIOS PER WATT, not absolute GB/s or GB.
+# Every absolute figure below is therefore derived, not quoted. This is also
+# vendor marketing for an unreleased part: treat all of it as directional.
+#   [H1] mem_bw (internal) = 48 TB/s, from the "6x bandwidth per watt vs HBM at
+#        large batch" claim applied to B200-class HBM3e (8 TB/s), assuming
+#        comparable power. If HBC runs at lower power, this is too high.
+#   [H2] mem_bw_external = 6 TB/s, i.e. an 8:1 internal:external ratio. The
+#        article says only "multiples". This ratio is THE decisive knob -- it
+#        alone determines whether HBC beats HBM. Sweep it before believing any
+#        single-point result.
+#   [H3] mem_capacity = 128 GB. From "200x capacity per watt vs SRAM": a 500 MB
+#        SRAM chip at ~500 W is ~1 MB/W, so 200x is ~200 MB/W -> ~100 GB at
+#        similar power. HBM-class. Unlike the Groq LPU there is NO capacity
+#        cliff here, so no small-batch OOM ceiling.
+#   [H4] Compute is DELIBERATELY WEAK: 500 TFLOPS FP8, ~11% of B200. Near-memory
+#        logic is not a tensor core. This is the whole point -- HBC wins on
+#        memory-bound ops and LOSES on dense GEMM. Setting this too high would
+#        silently turn HBC into a better GPU, which is not the architecture.
+#   [H5] Network knobs are placeholders reusing an HBM-class node template. HBC
+#        interconnect is not described in the article.
+#
+# NATURAL ROLE -- decode attention. Per token, attention reads the whole KV
+# cache and emits one vector, so bytes-read : bytes-that-must-leave is roughly
+# 2 x seq_len (~8000:1 at ISL 4000). That is exactly the operation HBC is built
+# for, and exactly the one that dominates decode on a GPU. Pair with a dense-
+# GEMM device (e.g. groq3_lpx) on the FFN side via AfdConfig.
+# ---------------------------------------------------------------------------
+
+data_dir: data/b200_sxm # borrowed backend data layout; SOL mode ignores the timings
+
+gpu:
+  mem_bw: 48000000000000 # 48 TB/s INTERNAL / in-stack [H1]
+  mem_bw_external: 6000000000000 # 6 TB/s interface [H2] -- INERT until Phase 2
+  mem_bw_empirical_scaling_factor: 0.85 # near-memory dataflow; between GPU 0.8 and LPU 0.95
+  mem_empirical_constant_latency: 0.000002 # 2us; in-stack access, no full HBM round-trip
+  mem_capacity: 137438953472 # 128 GB [H3] -- HBM-class, no capacity cliff
+  bfloat16_tc_flops: 250000000000000 # 250 TFLOPS [H4] 0.5 x FP8
+  int8_tc_flops: 500000000000000 # 500 TFLOPS [H4]
+  fp8_tc_flops: 500000000000000 # 500 TFLOPS [H4] deliberately ~11% of B200
+  fp4_tc_flops: 1000000000000000 # 1 PFLOPS [H4] 2 x FP8
+  power: 700 # Watt [H4/H5] placeholder, not published
+  sm_version: 100 # not meaningful for near-memory logic; kept so kernels resolve
+
+  # Operators eligible to execute IN-STACK. Anything not listed pays the
+  # external interface. INERT until Phase 2. Chosen on the read:write-ratio
+  # argument above -- attention compacts enormously, dense GEMM does not.
+  near_memory_ops:
+    - GenerationAttention
+    - ContextAttention
+    - ElementWise
+    - Embedding
+
+node: # [H5] placeholders -- HBC interconnect is not described in the source
+  num_gpus_per_node: 8
+  inter_node_bw: 100000000000 # Byte/s per device, single direction
+  intra_node_bw: 900000000000 # Byte/s per device, single direction
+  pcie_bw: 128000000000 # Byte/s, single direction, pcie 6.0
+  p2p_latency: 0.00001 # 10us
+
+misc:
+  nccl_mem:
+    1: 0
+    2: 358612992
+    4: 411041792
+    8: 411041792
+  other_mem: 3758096384
+  nccl_version: '2.27.3'

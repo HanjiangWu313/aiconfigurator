@@ -1,0 +1,82 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# ---------------------------------------------------------------------------
+# Groq 3 LPU / LPX rack -- ANALYTICAL PROXY SYSTEM
+# ---------------------------------------------------------------------------
+# This is an analytical proxy in the same spirit as the rubin_cpx_proxy /
+# r200_proxy systems described in tools/disagg_mixed_arch_experiment.py: it
+# borrows a real backend data layout (kernel shapes, op coverage) and overrides
+# the chip compute / memory / network knobs with published LPU numbers.
+#
+# USE WITH --database-mode SOL. SILICON mode would replay B200 kernel timings
+# and tell you nothing about the LPU.
+#
+# Published figures (vendor spec, 2026):
+#   Groq 3 LPU     : 500 MB on-chip SRAM (NO HBM), 150 TB/s SRAM bandwidth,
+#                    1.2 PFLOPs FP8, 98B transistors
+#   LPX rack       : 256 LPUs, 128 GB SRAM total, 40 PB/s aggregate memory BW,
+#                    640 TB/s scale-up bandwidth, MGX-compatible, liquid cooled
+#
+# Internal consistency of the published numbers (both check out, so the
+# per-chip values below are used as the primitives):
+#   256 x 500 MB   = 128 GB total SRAM                      [matches]
+#   256 x 150 TB/s = 38.4 PB/s ~ 40 PB/s aggregate          [matches]
+#
+# ASSUMPTIONS -- flagged because they are NOT in the published spec and they
+# move the results. Revisit each before quoting any number from this file:
+#   [A1] intra_node_bw = 640 TB/s / 256 = 2.5 TB/s per LPU, treated as
+#        SINGLE DIRECTION per LPU to match the convention used by every other
+#        system YAML in this directory. If the published 640 TB/s is instead an
+#        aggregate bidirectional figure, this value is 2x too high.
+#   [A2] bfloat16 = 0.5 x FP8 and FP4 = 2 x FP8. The spec only publishes FP8.
+#        LP30 ships INT8; NVFP4 arrives with LP35.
+#   [A3] inter_node_bw uses Spectrum-X / CX9-class Ethernet (800 Gb/s =
+#        100 GB/s per direction), since GPU<->LPU is Ethernet, not NVLink.
+#        The spec notes NVLink is NOT yet integrated (LP40 adds it).
+#   [A4] p2p_latency 1 us. The LPU is deterministic and pre-compiled with no
+#        runtime scheduler, so it should beat the 10 us used for GPU systems.
+#   [A5] power is a placeholder -- not published.
+#
+# STRUCTURAL CAVEAT -- the reason this system behaves unlike any GPU:
+#   500 MB per LPU means model weights alone force very wide tensor parallel.
+#   A 32B model at FP8 (~32 GB) needs >= 64 LPUs just to hold weights, before
+#   any KV cache. Expect OOM at the small TP values that work on a GPU, and
+#   read mem_capacity-driven results as the dominant effect.
+# ---------------------------------------------------------------------------
+
+data_dir: data/b200_sxm # borrowed backend data layout; SOL mode ignores the timings
+
+gpu:
+  mem_bw: 150000000000000 # 150 TB/s on-chip SRAM (vs 8 TB/s HBM3e on B200)
+  mem_bw_empirical_scaling_factor: 0.95 # deterministic pre-compiled dataflow, no scheduler -> near peak
+  mem_empirical_constant_latency: 0.000001 # 1us; SRAM has no HBM round-trip
+  mem_capacity: 524288000 # 500 MB SRAM per LPU -- NO HBM [structural caveat above]
+  bfloat16_tc_flops: 600000000000000 # 600 TFLOPS [A2] derived as 0.5 x FP8
+  int8_tc_flops: 1200000000000000 # 1.2 PFLOPS -- LP30 SKU ships INT8
+  fp8_tc_flops: 1200000000000000 # 1.2 PFLOPS FP8 (published)
+  fp4_tc_flops: 2400000000000000 # 2.4 PFLOPS [A2] derived as 2 x FP8; LP35 adds NVFP4
+  power: 500 # Watt [A5] placeholder, not published
+  sm_version: 100 # not meaningful for an LPU; kept so backend kernel selection resolves
+
+node:
+  num_gpus_per_node: 256 # one LPX rack = 256 LPUs on an all-to-all C2C backplane
+  inter_node_bw: 100000000000 # Byte/s per LPU, single direction [A3] Spectrum-X 800Gb/s
+  intra_node_bw: 2500000000000 # Byte/s per LPU, single direction [A1] 640 TB/s / 256
+  pcie_bw: 128000000000 # Byte/s, single direction, pcie 6.0
+  p2p_latency: 0.000001 # 1us [A4] deterministic C2C, no scheduler
+
+misc:
+  # [A6] These two knobs are CONSTANT per-chip overheads. Carrying the GPU
+  # template values here (nccl_mem 392MB + other_mem 256MB = ~640MB) exceeds the
+  # LPU's entire 500MB SRAM budget on its own, which makes every configuration
+  # report OOM no matter how far TP/PP is scaled -- a pure artifact of the proxy,
+  # not a property of the hardware. The LPU stack is not NCCL-based and has no
+  # CUDA allocator, so both are set to LPU-appropriate values.
+  nccl_mem: # no NCCL on the LPU; C2C collectives are compiled, not buffered
+    1: 0
+    2: 0
+    4: 0
+    8: 0
+  other_mem: 16777216 # 16MB runtime residual; deterministic pre-compiled dataflow
+  nccl_version: '2.27.3' # unused for this system; kept for schema compatibility

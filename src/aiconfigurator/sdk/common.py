@@ -330,6 +330,22 @@ DefaultHFModels = {
 """
 Supported systems (GPU types)
 """
+"""
+Analytical proxy systems.
+
+These describe hardware for which no performance data has been collected. They
+borrow another system's ``data_dir`` for kernel shapes / op coverage and override
+the chip compute, memory and network knobs with published vendor figures, so they
+are meaningful ONLY under ``DatabaseMode.SOL``. Because they reuse someone else's
+data directory, they intentionally have no folder of their own under
+``systems/data/`` and are exempt from the data-folder invariant asserted in
+``tests/unit/sdk/test_common.py``.
+"""
+ProxySystems = {
+    "groq3_lpx",  # Groq 3 LPU / LPX rack -- SRAM-only, no HBM
+    "hbc_proxy",  # HBC (High Bandwidth Compute) -- near-memory compute
+}
+
 SupportedSystems = {
     "h100_sxm",
     "h200_sxm",
@@ -340,6 +356,7 @@ SupportedSystems = {
     "a100_sxm",
     "l40s",
     "b60",
+    *ProxySystems,
 }
 
 """

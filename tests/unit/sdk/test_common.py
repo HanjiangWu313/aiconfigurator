@@ -10,6 +10,7 @@ Tests supported systems, model families, and other common configurations.
 from pathlib import Path
 
 import pytest
+import yaml
 
 from aiconfigurator.sdk import common
 
@@ -59,10 +60,23 @@ class TestSupportedSystems:
             "SupportedSystems set does not match YAML files in systems directory.\n"
         )
 
-        # Assert that the data folders match SupportedSystems
-        assert common.SupportedSystems.issubset(data_folder_names), (
+        # Analytical proxy systems borrow another system's data_dir and so have
+        # no folder of their own under systems/data/. Exempt them, but keep the
+        # invariant strict for every silicon-backed system.
+        silicon_systems = common.SupportedSystems - common.ProxySystems
+        assert silicon_systems.issubset(data_folder_names), (
             "SupportedSystems set does not match data folders in systems/data directory.\n"
         )
+
+        # Proxy systems must still declare a YAML and point at a data_dir that
+        # actually exists, otherwise they would fail at query time.
+        for proxy in common.ProxySystems:
+            assert proxy in yaml_system_names, f"Proxy system '{proxy}' has no YAML in systems/"
+            with open(systems_dir / f"{proxy}.yaml") as f:
+                borrowed = yaml.safe_load(f).get("data_dir", "")
+            assert (systems_dir / borrowed).is_dir(), (
+                f"Proxy system '{proxy}' points at missing data_dir '{borrowed}'"
+            )
 
 
 class TestSupportMatrix:

@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Groq study — code change map</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0; padding: 2.5rem 2rem;
+    font: 15px/1.55 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: #fafaf9; color: #1c1917;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { background: #1c1917; color: #e7e5e4; }
+    header p { color: #a8a29e !important; }
+    .legend span { color: #d6d3d1; }
+    figure { background: #292524; border-color: #44403c; }
+  }
+  header { max-width: 62rem; margin: 0 auto 1.75rem; }
+  h1 { font-size: 1.35rem; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  header p { margin: 0; color: #57534e; font-size: .92rem; }
+  .legend {
+    max-width: 62rem; margin: 0 auto 1.25rem;
+    display: flex; gap: 1.5rem; flex-wrap: wrap; font-size: .85rem;
+  }
+  .legend span { display: inline-flex; align-items: center; gap: .45rem; }
+  .sw { width: .85rem; height: .85rem; border-radius: 3px; display: inline-block; }
+  figure {
+    max-width: 62rem; margin: 0 auto; padding: 1.5rem;
+    background: #fff; border: 1px solid #e7e5e4; border-radius: 10px;
+    overflow-x: auto;
+  }
+  .mermaid { display: flex; justify-content: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Groq study — code change map</h1>
+  <p>Call path through the aiconfigurator SDK, with the seven touch points marked.
+     15 lines changed across two SDK files; the middle of the pipeline is untouched.</p>
+</header>
+
+<div class="legend">
+  <span><i class="sw" style="background:#f59e0b"></i> modified</span>
+  <span><i class="sw" style="background:#10b981"></i> new</span>
+  <span><i class="sw" style="background:#e7e5e4;border:1px solid #a8a29e"></i> untouched</span>
+  <span><i class="sw" style="background:#6366f1"></i> output</span>
+</div>
+
+<figure>
+<pre class="mermaid">
+flowchart TD
+    subgraph RUNNERS["RUNNER SCRIPTS — aiconfigurator-afd-plot (separate repo)"]
+        R1["disagg_mixed_arch_experiment.py<br/><i>2 bug fixes</i>"]
+        R2["network_topology_sensitivity_study.py<br/><i>new — Switch vs Ring x bandwidth</i>"]
+        R3["gpu_lpu_link_bandwidth_study.py<br/><i>new — GPU to LPU link sweep</i>"]
+    end
+
+    subgraph CONFIG["SYSTEM SPECS — src/aiconfigurator/systems/"]
+        Y1["b200_sxm.yaml / h200_sxm.yaml / gb200.yaml<br/><i>unchanged — read for bandwidth</i>"]
+        Y2["groq3_lpx.yaml<br/><i>new — 500MB SRAM, 2.5TB/s C2C,<br/>LPU memory constants A6</i>"]
+    end
+
+    subgraph SDK["SDK — src/aiconfigurator/sdk/"]
+        C1["common.py :: SupportedSystems<br/><i>+ groq3_lpx (hardcoded set)</i>"]
+        P1["perf_database.py :: PerfDatabase<br/><i>unchanged — loads data_dir</i>"]
+        I1["inference_session.py :: DisaggInferenceSession<br/><i>unchanged — manager from PREFILL spec only</i>"]
+        I2["run_disagg → _build_gpu_layout<br/><i>unchanged</i>"]
+    end
+
+    subgraph ASTRA["ASTRASIM LAYER — sdk/astrasim_utils.py"]
+        A1["AstraSimManager.__init__<br/><i>+ tier_topology_override param</i>"]
+        A2["simulate_kv_cache_transfer<br/><i>unchanged</i>"]
+        A3["_simulate_tiered_transfers<br/><i>unchanged</i>"]
+        A4["_tier_topology_params<br/><i>+ override wins over hardcoded Switch</i>"]
+        A5["get_or_create_topology_config<br/><i>unchanged — emits topology YAML</i>"]
+    end
+
+    subgraph CPP["C++ ENGINE — network_backend/astra-network-analytical/"]
+        X1["simulation_py_congestion_aware.so<br/><i>unchanged — rebuilt only</i>"]
+    end
+
+    OUT["kv_network_latency_ms<br/>+ (d)memory → SRAM check"]
+
+    R1 --> P1
+    R2 --> A1
+    R3 --> A1
+    R2 --> P1
+    R3 --> P1
+
+    Y1 --> P1
+    Y2 --> P1
+    C1 -.->|validates system name| P1
+
+    P1 --> I1
+    A1 --> I1
+    I1 --> I2
+    I2 --> A2
+    A2 --> A3
+    A3 --> A4
+    A4 --> A5
+    A5 --> X1
+    X1 --> OUT
+    OUT --> R1
+    OUT --> R2
+    OUT --> R3
+
+    classDef changed fill:#f59e0b,stroke:#b45309,stroke-width:2px,color:#1c1917
+    classDef new fill:#10b981,stroke:#047857,stroke-width:2px,color:#052e16
+    classDef same fill:#e7e5e4,stroke:#a8a29e,stroke-width:1px,color:#44403c
+    classDef result fill:#6366f1,stroke:#4338ca,stroke-width:2px,color:#eef2ff
+
+    class R1,A1,A4,C1 changed
+    class R2,R3,Y2 new
+    class Y1,P1,I1,I2,A2,A3,A5,X1 same
+    class OUT result
+</pre>
+</figure>
+
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'default',
+    flowchart: { curve: 'basis', nodeSpacing: 45, rankSpacing: 55 }
+  });
+</script>
+</body>
+</html>

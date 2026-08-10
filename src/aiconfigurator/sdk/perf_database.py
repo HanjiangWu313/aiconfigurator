@@ -3817,6 +3817,47 @@ class PerfDatabase:
             return common.GEMMQuantMode.fp8
         return quant_mode
 
+    def _mem_bw(self, op: str | None = None) -> float:
+        """Effective memory bandwidth in Bytes/s for operator *op*.
+
+        Conventional devices (GPU, and any SRAM-only part like the Groq LPU)
+        expose a single memory bandwidth: compute sits outside the memory, so
+        every byte crosses one interface and ``gpu.mem_bw`` fully describes it.
+
+        Near-memory / processing-in-memory devices (HBC, "High Bandwidth
+        Compute") break that assumption.  Compute logic lives *inside* the
+        memory stack, so a data-intensive operator runs against a very high
+        **internal** bandwidth and only its compact result crosses a much
+        narrower **external** interface.  Such a system declares::
+
+            gpu:
+              mem_bw: <internal, in-stack>
+              mem_bw_external: <interface leaving the stack>
+              near_memory_ops: [GenerationAttention, ContextAttention, ...]
+
+        Operators named in ``near_memory_ops`` are costed at the internal
+        bandwidth; everything else pays the external interface.
+
+        BACKWARD COMPATIBILITY: when ``mem_bw_external`` is absent -- which is
+        the case for every silicon-backed system YAML in this repo -- this
+        returns ``gpu.mem_bw`` unconditionally, so results are byte-identical
+        to the previous single-scalar behaviour.
+
+        Args:
+            op: Logical operator name, or None for "not attributable to a
+                specific operator" (treated as not near-memory eligible).
+
+        Returns:
+            Bandwidth in Bytes/s to divide byte counts by.
+        """
+        gpu = self.system_spec["gpu"]
+        internal = gpu["mem_bw"]
+        external = gpu.get("mem_bw_external")
+        if external is None:
+            return internal
+        eligible = gpu.get("near_memory_ops") or ()
+        return internal if (op is not None and op in eligible) else external
+
     @functools.lru_cache(maxsize=32768)
     def query_gemm(
         self,
@@ -3854,7 +3895,7 @@ class PerfDatabase:
             """
             tc_flops = self._get_quant_tc_flops(quant_mode)
             sol_math = 2 * m * n * k / tc_flops * 1000
-            sol_mem = quant_mode.value.memory * (m * n + m * k + n * k) / self.system_spec["gpu"]["mem_bw"] * 1000
+            sol_mem = quant_mode.value.memory * (m * n + m * k + n * k) / self._mem_bw("GEMM") * 1000
             sol_time = max(sol_math, sol_mem)
             return sol_time, sol_math, sol_mem
 
@@ -3947,7 +3988,7 @@ class PerfDatabase:
             """
             Get the sol time, sol math and sol mem
             """
-            sol_mem = 2 * m * k / self.system_spec["gpu"]["mem_bw"] * 1000.0
+            sol_mem = 2 * m * k / self._mem_bw("ComputeScale") * 1000.0
             sol_time = sol_mem
             return sol_time, 0, sol_mem
 
@@ -4038,7 +4079,7 @@ class PerfDatabase:
             """
             Get the sol time, sol math and sol mem
             """
-            sol_mem = 3 * m * k / self.system_spec["gpu"]["mem_bw"] * 1000.0
+            sol_mem = 3 * m * k / self._mem_bw("ScaleMatrix") * 1000.0
             sol_time = sol_mem
             return sol_time, 0, sol_mem
 
@@ -4171,7 +4212,7 @@ class PerfDatabase:
                 + kvcache_quant_mode.value.memory * b * (2 * n_kv * full_s * h)  # K,V read
             )  # TODO fp8 io
             sol_math = ops / self.system_spec["gpu"]["bfloat16_tc_flops"] * 1000 / fmha_quant_mode.value.compute
-            sol_mem = mem_bytes / self.system_spec["gpu"]["mem_bw"] * 1000
+            sol_mem = mem_bytes / self._mem_bw("ContextAttention") * 1000
             sol_time = max(sol_math, sol_mem)
             return sol_time, sol_math, sol_mem
 
@@ -4313,7 +4354,7 @@ class PerfDatabase:
             )
 
             sol_math = ops / self.system_spec["gpu"]["bfloat16_tc_flops"] * 1000 / quant_mode_gen.value.compute
-            sol_mem = mem_bytes / self.system_spec["gpu"]["mem_bw"] * 1000
+            sol_mem = mem_bytes / self._mem_bw("GenerationAttention") * 1000
             sol_time = max(sol_math, sol_mem)
             return sol_time, sol_math, sol_mem
 
@@ -4432,7 +4473,7 @@ class PerfDatabase:
                 b * num_heads * (kvcache_quant_mode.value.memory * full_s * (192 + 128) + 2 * s * (192 + 128))
             )  # 2 for qk, TODO
             sol_math = ops / self.system_spec["gpu"]["bfloat16_tc_flops"] * 1000 / fmha_quant_mode.value.compute
-            sol_mem = mem_bytes / self.system_spec["gpu"]["mem_bw"] * 1000
+            sol_mem = mem_bytes / self._mem_bw("ContextMLA") * 1000
             sol_time = max(sol_math, sol_mem)
             return sol_time, sol_math, sol_mem
 
@@ -4524,7 +4565,7 @@ class PerfDatabase:
             mem_bytes = b * (num_heads * 1088 * 2 + (s - 1) * 576 * kvcache_quant_mode.value.memory)
             # bfloat16 io + bfloat16/fp8 kv cache, TODO fp8 io
             sol_math = ops / self.system_spec["gpu"]["bfloat16_tc_flops"] * 1000 / quant_mode_gen.value.compute
-            sol_mem = mem_bytes / self.system_spec["gpu"]["mem_bw"] * 1000
+            sol_mem = mem_bytes / self._mem_bw("GenerationMLA") * 1000
             sol_time = max(sol_math, sol_mem)
             return sol_time, sol_math, sol_mem
 
@@ -4613,7 +4654,7 @@ class PerfDatabase:
             ops = b * num_heads * 2 / 2 * (192 + 128) * (full_s * full_s - prefix * prefix)
             mem_bytes = b * num_heads * (kvcache_quant_mode.value.memory * full_s * (192 + 128) + 2 * s * (192 + 128))
             sol_math = ops / self.system_spec["gpu"]["bfloat16_tc_flops"] * 1000 / fmha_quant_mode.value.compute
-            sol_mem = mem_bytes / self.system_spec["gpu"]["mem_bw"] * 1000
+            sol_mem = mem_bytes / self._mem_bw("ContextMLA") * 1000
             sol_time = max(sol_math, sol_mem)
             return sol_time, sol_math, sol_mem
 
@@ -4706,12 +4747,12 @@ class PerfDatabase:
             attn_ops = 2 * b * num_heads * 1088 * s
             mem_bytes = b * (num_heads * 1088 * 2 + (s - 1) * 576 * kv_cache_dtype.value.memory)
             sol_math = attn_ops / self.system_spec["gpu"]["bfloat16_tc_flops"] * 1000 / quant_mode_gen.value.compute
-            sol_mem = mem_bytes / self.system_spec["gpu"]["mem_bw"] * 1000
+            sol_mem = mem_bytes / self._mem_bw("GenerationMLA") * 1000
             # Add BMM pre + post SOL (same as query_mla_bmm)
             bmm_ops = 2 * 2 * b * num_heads * 128 * 512  # pre + post
             bmm_mem = 2 * num_heads * (b * 640 + 128 * 512) * gemm_quant_mode.value.memory
             bmm_math = bmm_ops / (self.system_spec["gpu"]["bfloat16_tc_flops"] * gemm_quant_mode.value.compute) * 1000
-            bmm_mem_time = bmm_mem / self.system_spec["gpu"]["mem_bw"] * 1000
+            bmm_mem_time = bmm_mem / self._mem_bw("GenerationMLA") * 1000
             sol_math += bmm_math
             sol_mem += bmm_mem_time
             sol_time = max(sol_math, sol_mem)
@@ -4823,7 +4864,7 @@ class PerfDatabase:
             mem_bytes = (q_b_mem + q_w_kc_mem + attn_mem * 2 + s_w_vc_mem + attn_out_mem) * fmha_quant_mode.value.memory
             sol_math = ops / (self.system_spec["gpu"]["bfloat16_tc_flops"] * fmha_quant_mode.value.compute) * 1000
             sol_math += attn_flop / (self.system_spec["gpu"]["bfloat16_tc_flops"]) * 1000
-            sol_mem = mem_bytes / self.system_spec["gpu"]["mem_bw"] * 1000
+            sol_mem = mem_bytes / self._mem_bw("GenerationMLA") * 1000
             sol_time = max(sol_math, sol_mem)
 
             return sol_time, sol_math, sol_mem
@@ -4947,7 +4988,7 @@ class PerfDatabase:
             mem_bytes = (q_b_mem + kv_b_mem + attn_mem * 2 + attn_out_mem) * fmha_quant_mode.value.memory
             sol_math = ops / (self.system_spec["gpu"]["bfloat16_tc_flops"] * fmha_quant_mode.value.compute) * 1000
             sol_math += attn_flop / (self.system_spec["gpu"]["bfloat16_tc_flops"]) * 1000
-            sol_mem = mem_bytes / self.system_spec["gpu"]["mem_bw"] * 1000
+            sol_mem = mem_bytes / self._mem_bw("ContextMLA") * 1000
             sol_time = max(sol_math, sol_mem)
             return sol_time, sol_math, sol_mem
 
@@ -5343,7 +5384,7 @@ class PerfDatabase:
                 * min(num_experts // moe_ep_size, total_tokens // moe_ep_size)
             )
             sol_math = ops / (self.system_spec["gpu"]["bfloat16_tc_flops"] * quant_mode.value.compute) * 1000
-            sol_mem = mem_bytes / self.system_spec["gpu"]["mem_bw"] * 1000
+            sol_mem = mem_bytes / self._mem_bw("MoE") * 1000
             sol_time = max(sol_math, sol_mem)
             return sol_time, sol_math, sol_mem
 
@@ -5705,7 +5746,7 @@ class PerfDatabase:
             ops = 2 * num_tokens * num_heads * 128 * 512  # 2 for fma
             mem_bytes = num_heads * (num_tokens * 640 + 128 * 512) * quant_mode.value.memory
             sol_math = ops / (self.system_spec["gpu"]["bfloat16_tc_flops"] * quant_mode.value.compute) * 1000
-            sol_mem = mem_bytes / self.system_spec["gpu"]["mem_bw"] * 1000
+            sol_mem = mem_bytes / self._mem_bw("MLABmm") * 1000
             sol_time = max(sol_math, sol_mem)
             return sol_time, sol_math, sol_mem
 
@@ -5785,7 +5826,7 @@ class PerfDatabase:
             """
             Get the sol time, sol math and sol mem
             """
-            sol_time = mem_bytes / self.system_spec["gpu"]["mem_bw"] * 1000
+            sol_time = mem_bytes / self._mem_bw("ElementWise") * 1000
             return sol_time, 0, sol_time
 
         def get_empirical(mem_bytes: int) -> float:
@@ -5794,7 +5835,7 @@ class PerfDatabase:
             """
             return (
                 mem_bytes
-                / (self.system_spec["gpu"]["mem_bw"] * self.system_spec["gpu"]["mem_bw_empirical_scaling_factor"])
+                / (self._mem_bw("ElementWise") * self.system_spec["gpu"]["mem_bw_empirical_scaling_factor"])
                 + self.system_spec["gpu"]["mem_empirical_constant_latency"]
             ) * 1000
 
@@ -5853,7 +5894,7 @@ class PerfDatabase:
                 ssm_read_bytes = x * (d_inner + n_groups * d_state * 2 + nheads) * 2
                 ssm_write_bytes = x * d_inner * 2
                 total_bytes = ssm_read_bytes + ssm_write_bytes
-            sol_mem = total_bytes / self.system_spec["gpu"]["mem_bw"] * 1000
+            sol_mem = total_bytes / self._mem_bw("Mamba2Kernel") * 1000
             return sol_mem, 0, sol_mem
 
         if not mamba2_data:
@@ -5988,7 +6029,7 @@ class PerfDatabase:
             else:
                 read_bytes = x * d_model * 2
                 write_bytes = x * d_model * 2
-            sol_mem = (read_bytes + write_bytes) / self.system_spec["gpu"]["mem_bw"] * 1000
+            sol_mem = (read_bytes + write_bytes) / self._mem_bw("GDNKernel") * 1000
             return sol_mem, 0, sol_mem
 
         if not gdn_data:
@@ -6406,7 +6447,7 @@ class PerfDatabase:
                 * min(num_slots // moe_ep_size, total_tokens // moe_ep_size)  # weights (use num_slots)
             )
             sol_math = ops / (self.system_spec["gpu"]["bfloat16_tc_flops"] * quant_mode.value.compute) * 1000
-            sol_mem = mem_bytes / self.system_spec["gpu"]["mem_bw"] * 1000
+            sol_mem = mem_bytes / self._mem_bw("MoE") * 1000
             sol_time = max(sol_math, sol_mem)
             return sol_time, sol_math, sol_mem
 
@@ -6938,7 +6979,7 @@ class PerfDatabase:
             sol_math = (
                 gemm_group_ops / gemm_flops + indexer_logits_ops / indexer_fp8_flops + sparse_attn_ops / attn_flops
             ) * 1000
-            sol_mem = total_mem / self.system_spec["gpu"]["mem_bw"] * 1000
+            sol_mem = total_mem / self._mem_bw("ContextAttention") * 1000
             sol_time = max(sol_math, sol_mem)
             return sol_time, sol_math, sol_mem
 
@@ -7108,7 +7149,7 @@ class PerfDatabase:
             sol_math = (
                 gemm_group_ops / gemm_flops + indexer_logits_ops / indexer_fp8_flops + sparse_attn_ops / attn_flops
             ) * 1000
-            sol_mem = total_mem / self.system_spec["gpu"]["mem_bw"] * 1000
+            sol_mem = total_mem / self._mem_bw("GenerationAttention") * 1000
             sol_time = max(sol_math, sol_mem)
             return sol_time, sol_math, sol_mem
 
