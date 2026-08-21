@@ -46,10 +46,22 @@
 #        SRAM chip at ~500 W is ~1 MB/W, so 200x is ~200 MB/W -> ~100 GB at
 #        similar power. HBM-class. Unlike the Groq LPU there is NO capacity
 #        cliff here, so no small-batch OOM ceiling.
-#   [H4] Compute is DELIBERATELY WEAK: 500 TFLOPS FP8, ~11% of B200. Near-memory
-#        logic is not a tensor core. This is the whole point -- HBC wins on
-#        memory-bound ops and LOSES on dense GEMM. Setting this too high would
-#        silently turn HBC into a better GPU, which is not the architecture.
+#   [H4] 500 TFLOPS FP8. NO published figure exists -- Qualcomm declined on the
+#        record to disclose peak FLOPS for AI250 (= HBC Gen 1), and publishes no
+#        compute row in its spec table at all. This value is INVENTED, not
+#        derived: "~11% of B200" is 500/4500 restated, not a citation.
+#        Defensible only as the midpoint of a ~20x bracket:
+#          ~96 TFLOPS  -- PIM 1-FLOP/byte invariant applied to [H1]'s 48 TB/s
+#          ~266 TFLOPS -- same invariant on Qualcomm's published 133 TB/s
+#          ~1-5 PFLOPS -- Qualcomm accelerator lineage (Cloud AI 100 Ultra @3nm)
+#        CORRECTION: an earlier version of this comment argued "near-memory logic
+#        is not a tensor core, so HBC LOSES on dense GEMM." That premise conflates
+#        two architecture classes. The ~2-ops-per-element ceiling is real for
+#        BANK-LEVEL in-DRAM PIM (Samsung HBM-PIM, SK hynix AiM), but HBC is a
+#        LOGIC-PROCESS BASE DIE under the stack -- the Samsung CXL-PNM case, which
+#        carries a dedicated PE array precisely to do dense GEMM. So HBC probably
+#        CAN do GEMM in-stack. See docs/hbc_groq_study_findings.md section 6.
+#        TREAT [H4] AS A DECISIVE KNOB ON PAR WITH [H2] -- it is unswept.
 #   [H5] Network knobs are placeholders reusing an HBM-class node template. HBC
 #        interconnect is not described in the article.
 #
@@ -76,8 +88,17 @@ gpu:
   sm_version: 100 # not meaningful for near-memory logic; kept so kernels resolve
 
   # Operators eligible to execute IN-STACK. Anything not listed pays the
-  # external interface. INERT until Phase 2. Chosen on the read:write-ratio
-  # argument above -- attention compacts enormously, dense GEMM does not.
+  # external interface. Chosen on the read:write-ratio argument above --
+  # attention compacts enormously, dense GEMM does not.
+  #
+  # OPEN QUESTION -- THIS LIST IS A STUDY INVENTION, NOT VENDOR GUIDANCE.
+  # The source never states which operations the in-stack logic can perform.
+  # Excluding GEMM is the single highest-leverage assumption in the study: if
+  # GEMM is in fact near-memory eligible, its 1.33x penalty (8/6, external)
+  # becomes a 6x ADVANTAGE (internal), and the case for offloading FFN to a
+  # separate device may collapse entirely. Per [H4] above, the architectural
+  # evidence leans toward GEMM being possible on a logic-process base die.
+  # Untested. See docs/hbc_groq_study_findings.md sections 6.1 and 8.
   near_memory_ops:
     - GenerationAttention
     - ContextAttention
